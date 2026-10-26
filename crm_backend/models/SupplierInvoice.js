@@ -1,0 +1,566 @@
+import mongoose from "mongoose";
+import { purchaseSchemeBenefitsSchema as supplierInvoiceSchemeBenefitsSchema } from "./purchaseSchemeBenefit.js";
+import { addCreditDays } from "../utils/creditTerms.js";
+
+const supplierInvoiceItemSchema = new mongoose.Schema({
+  product: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Product",
+    required: true
+  },
+  productCode: String,
+  productName: String,
+  HSNCode: String,
+  quantity: {
+    type: Number,
+    required: true,
+    min: 1
+  },
+  unitPrice: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  gst: {
+    type: Number,
+    default: 0
+  },
+  gstAmount: {
+    type: Number,
+    default: 0
+  },
+  // Purchase discount information for this item
+  purchaseDiscount: {
+    directDiscountPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    },
+    directDiscountAmount: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    supplierExtraDiscountPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    },
+    supplierExtraDiscountAmount: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    floatingDiscountPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    },
+    floatingDiscountAmount: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    totalDiscountPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    },
+    totalDiscountAmount: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    applicableDiscounts: [{
+      id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "PurchaseDiscountMapping"
+      },
+      name: String,
+      directDiscountPercentage: Number,
+      floatingDiscountEnabled: Boolean,
+      floatingDiscountMin: Number,
+      floatingDiscountMax: Number
+    }]
+  },
+  // Legacy discount fields for backward compatibility
+  discountPercentage: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  discountAmount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  subtotal: {
+    type: Number,
+    default: 0
+  },
+  totalPrice: {
+    type: Number,
+    required: true
+  },
+  // Supplier bill comparison fields
+  supplierPrice: {    // Manual entry: what supplier actually billed per unit (before GST)
+    type: Number,
+    default: null
+  },
+  supplierBillAmount: { // supplierPrice × billQuantity
+    type: Number,
+    default: null
+  },
+  supplierMRP: {      // Auto-calc: supplierPrice × (1 + gst/100)
+    type: Number,
+    default: null
+  },
+  ourMRP: {           // From Product master mrp field
+    type: Number,
+    default: null
+  },
+  poAmount: {         // Our PO price × bill qty (what we expected to pay)
+    type: Number,
+    default: null
+  },
+  amountDifference: { // supplierBillAmount - poAmount
+    type: Number,
+    default: 0
+  },
+  differencePercentage: { // ((supplierBillAmount - poAmount) / poAmount) × 100
+    type: Number,
+    default: 0
+  },
+  discountAmountPO: { // Total discount from PO in ₹
+    type: Number,
+    default: 0
+  },
+  discountPercentagePO: { // Total discount % from PO
+    type: Number,
+    default: 0
+  },
+  afterDiscountAmount: { // After all discounts total (qty level)
+    type: Number,
+    default: null
+  },
+  afterDiscountCost: { // Per unit after discount
+    type: Number,
+    default: null
+  },
+  ourDiscountExclGst: { type: Number, default: null },
+  ourDiscountInclGst: { type: Number, default: null },
+  supplierDiscountExclGst: { type: Number, default: null },
+  supplierDiscountInclGst: { type: Number, default: null },
+  billQuantity: {     // From GRN companyBillQuantity
+    type: Number,
+    default: null
+  },
+  warehouse: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Warehouse"
+  },
+  warehouseName: String
+});
+
+const supplierInvoiceSchema = new mongoose.Schema({
+  invoiceNumber: {
+    type: String,
+    unique: true
+  },
+  supplier: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Supplier",
+    required: true
+  },
+  supplierName: String,
+  supplierCode: String,
+  supplierGSTIN: String,
+  supplierAddress: String,
+  supplierPhone: String,
+  supplierEmail: String,
+  
+  // GRN Reference
+  grn: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "GRN",
+    required: true
+  },
+  grnNumber: String,
+  
+  // Purchase Order Reference
+  purchaseOrder: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "PurchaseOrder"
+  },
+  purchaseOrderNumber: String,
+  
+  // Invoice Details
+  invoiceDate: {
+    type: Date,
+    required: true,
+    default: Date.now
+  },
+  dueDate: Date,
+  creditDays: {
+    type: Number,
+    default: 30
+  },
+  
+  // Items
+  items: [supplierInvoiceItemSchema],
+  
+  // Financial Calculations
+  subtotal: {
+    type: Number,
+    required: true,
+    default: 0
+  },
+  
+  // Purchase Discount Information (new structure)
+  totalDirectDiscount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  totalFloatingDiscount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  totalDiscount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  
+  // Purchase discount summary
+  purchaseDiscountSummary: {
+    directDiscountApplied: {
+      type: Boolean,
+      default: false
+    },
+    floatingDiscountApplied: {
+      type: Boolean,
+      default: false
+    },
+    totalSavings: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    savingsPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    }
+  },
+  
+  // Legacy Discount Information (for backward compatibility)
+  directDiscountPercentage: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  floatingDiscountPercentage: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  totalDiscountPercentage: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  totalDiscountAmount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  
+  totalGst: {
+    type: Number,
+    default: 0
+  },
+  totalAmount: {
+    type: Number,
+    required: true
+  },
+  // Supplier's actual billed total (sum of all supplierPrice per item + GST)
+  supplierBilledTotal: {
+    type: Number,
+    default: null
+  },
+  
+  // Service Charges (NEW)
+  serviceCharges: [{
+    serviceChargeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ServiceChargeMaster"
+    },
+    chargeName: {
+      type: String,
+      required: true
+    },
+    description: String,
+    sacCode: String,
+    amount: {
+      type: Number,
+      required: true,
+      min: 0
+    },
+    taxApplicable: {
+      type: Boolean,
+      default: false
+    },
+    taxRate: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    },
+    cgst: {
+      type: Number,
+      default: 0
+    },
+    sgst: {
+      type: Number,
+      default: 0
+    },
+    igst: {
+      type: Number,
+      default: 0
+    },
+    taxAmount: {
+      type: Number,
+      default: 0
+    },
+    totalAmount: {
+      type: Number,
+      required: true
+    }
+  }],
+  
+  // Service Charges Totals (NEW)
+  serviceChargesSubtotal: {
+    type: Number,
+    default: 0
+  },
+  serviceChargesTax: {
+    type: Number,
+    default: 0
+  },
+  serviceChargesTotal: {
+    type: Number,
+    default: 0
+  },
+  
+  // Status and Tracking
+  status: {
+    type: String,
+    enum: ["Draft", "Pending", "Approved", "Paid", "Cancelled"],
+    default: "Draft"
+  },
+  paymentStatus: {
+    type: String,
+    enum: ["Pending", "Partial", "Paid", "Overdue"],
+    default: "Pending"
+  },
+  paidAmount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  paymentDate: Date,
+  
+  // Approval Information
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  },
+  approvedAt: Date,
+  
+  // System Fields
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true
+  },
+  remarks: String,
+  supplierInvoiceRef: String, // Supplier's own invoice number for reference
+  internalNotes: String,
+  // Purchase schemes (the `Points` model) that fired when this invoice was
+  // approved. Written by services/schemeService.js. A record only — it does not
+  // change the invoice totals, the ledger or stock, so it is safe to recompute.
+  purchaseSchemeBenefits: {
+    type: supplierInvoiceSchemeBenefitsSchema,
+    default: () => ({})
+  }
+}, {
+  timestamps: true
+});
+
+// Pre-save middleware to calculate amounts and dates
+supplierInvoiceSchema.pre("save", function(next) {
+  // Calculate due date.
+  //
+  // `creditDays: 0` means "due on the invoice date" — a real value, and a
+  // truthiness check would SKIP the assignment and leave `dueDate` unset, so the
+  // invoice never appears in the payables aging report. Checked against
+  // null/undefined instead. Mirrors models/DealerInvoice.js.
+  if (this.invoiceDate && this.creditDays !== null && this.creditDays !== undefined) {
+    const dueDate = addCreditDays(this.invoiceDate, this.creditDays);
+    if (dueDate) this.dueDate = dueDate;
+  }
+
+  // Calculate financial amounts (only if not already provided)
+  if (this.subtotal === undefined || this.subtotal === 0) {
+    this.subtotal = this.items.reduce((sum, item) => {
+      return sum + (item.quantity * item.unitPrice);
+    }, 0);
+  }
+
+  if (this.totalGst === undefined || this.totalGst === 0) {
+    this.totalGst = this.items.reduce((sum, item) => {
+      return sum + (item.gstAmount || 0);
+    }, 0);
+  }
+
+  // Calculate purchase discount amounts (new structure)
+  if (this.totalDirectDiscount === undefined) {
+    this.totalDirectDiscount = this.items.reduce((sum, item) => {
+      return sum + (item.purchaseDiscount?.directDiscountAmount || 0);
+    }, 0);
+  }
+
+  if (this.totalFloatingDiscount === undefined) {
+    this.totalFloatingDiscount = this.items.reduce((sum, item) => {
+      return sum + (item.purchaseDiscount?.floatingDiscountAmount || 0);
+    }, 0);
+  }
+
+  if (this.totalDiscount === undefined) {
+    this.totalDiscount = this.totalDirectDiscount + this.totalFloatingDiscount;
+  }
+
+  // Update purchase discount summary
+  if (this.purchaseDiscountSummary) {
+    this.purchaseDiscountSummary.directDiscountApplied = this.totalDirectDiscount > 0;
+    this.purchaseDiscountSummary.floatingDiscountApplied = this.totalFloatingDiscount > 0;
+    this.purchaseDiscountSummary.totalSavings = this.totalDiscount;
+    this.purchaseDiscountSummary.savingsPercentage = this.subtotal > 0 ? ((this.totalDiscount / this.subtotal) * 100) : 0;
+  }
+
+  // Legacy discount calculations (for backward compatibility)
+  this.totalDiscountPercentage = (this.directDiscountPercentage || 0) + (this.floatingDiscountPercentage || 0);
+  this.totalDiscountAmount = Math.max(this.totalDiscount, (this.subtotal * this.totalDiscountPercentage) / 100);
+
+  // Calculate product total: subtotal - discount + GST
+  const productTotal = this.subtotal - this.totalDiscount + this.totalGst;
+  
+  // Calculate service charges totals
+  this.serviceCharges = this.serviceCharges || [];
+  this.serviceCharges.forEach(charge => {
+    // Calculate tax amounts if applicable
+    if (charge.taxApplicable && charge.taxRate > 0) {
+      const taxAmount = (charge.amount * charge.taxRate) / 100;
+      charge.cgst = taxAmount / 2;
+      charge.sgst = taxAmount / 2;
+      charge.igst = 0; // For now, intra-state only. TODO: Add inter-state logic
+      charge.taxAmount = taxAmount;
+      charge.totalAmount = charge.amount + taxAmount;
+    } else {
+      charge.cgst = 0;
+      charge.sgst = 0;
+      charge.igst = 0;
+      charge.taxAmount = 0;
+      charge.totalAmount = charge.amount;
+    }
+  });
+  
+  this.serviceChargesSubtotal = this.serviceCharges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
+  this.serviceChargesTax = this.serviceCharges.reduce((sum, charge) => sum + (charge.taxAmount || 0), 0);
+  this.serviceChargesTotal = this.serviceCharges.reduce((sum, charge) => sum + (charge.totalAmount || 0), 0);
+  
+  // Grand total = products + service charges
+  this.totalAmount = productTotal + this.serviceChargesTotal;
+
+  next();
+});
+
+// Pre-save for item calculations
+supplierInvoiceSchema.pre("save", function(next) {
+  this.items.forEach(item => {
+    const baseAmount = item.quantity * item.unitPrice;
+    
+    // Set subtotal for the item
+    if (!item.subtotal) {
+      item.subtotal = baseAmount;
+    }
+    
+    // Calculate purchase discounts if present
+    if (item.purchaseDiscount) {
+      const directDiscount = (baseAmount * (item.purchaseDiscount.directDiscountPercentage || 0)) / 100;
+      const afterDirectDiscount = baseAmount - directDiscount;
+      const floatingDiscount = (afterDirectDiscount * (item.purchaseDiscount.floatingDiscountPercentage || 0)) / 100;
+      const totalDiscount = directDiscount + floatingDiscount;
+      const afterAllDiscounts = baseAmount - totalDiscount;
+      
+      // Update purchase discount amounts
+      item.purchaseDiscount.directDiscountAmount = directDiscount;
+      item.purchaseDiscount.floatingDiscountAmount = floatingDiscount;
+      item.purchaseDiscount.totalDiscountAmount = totalDiscount;
+      item.purchaseDiscount.totalDiscountPercentage = baseAmount > 0 ? ((totalDiscount / baseAmount) * 100) : 0;
+      
+      // Update legacy discount fields for backward compatibility
+      item.discountAmount = totalDiscount;
+      item.discountPercentage = item.purchaseDiscount.totalDiscountPercentage;
+      
+      // Calculate GST on discounted amount
+      item.gstAmount = (afterAllDiscounts * (item.gst || 0)) / 100;
+      item.totalPrice = afterAllDiscounts + item.gstAmount;
+    } else {
+      // No purchase discount - calculate normally
+      item.gstAmount = (baseAmount * (item.gst || 0)) / 100;
+      item.totalPrice = baseAmount + item.gstAmount;
+    }
+  });
+  next();
+});
+
+// Generate invoice number
+supplierInvoiceSchema.pre("save", async function(next) {
+  if (!this.invoiceNumber) {
+    try {
+      const year = new Date().getFullYear();
+      const count = await this.constructor.countDocuments();
+      this.invoiceNumber = `SI-${year}-${String(count + 1).padStart(4, "0")}`;
+    } catch (error) {
+      console.error("Error generating invoice number:", error);
+      // Fallback: generate based on timestamp
+      this.invoiceNumber = `SI-${Date.now()}`;
+    }
+  }
+  next();
+});
+
+// Index for better query performance
+supplierInvoiceSchema.index({ supplier: 1 });
+supplierInvoiceSchema.index({ invoiceDate: -1 });
+supplierInvoiceSchema.index({ status: 1 });
+supplierInvoiceSchema.index({ paymentStatus: 1 });
+supplierInvoiceSchema.index({ grn: 1 });
+supplierInvoiceSchema.index({ purchaseOrder: 1 });
+
+// Export schema for multi-database support
+export { supplierInvoiceSchema };
+
+export default mongoose.model("SupplierInvoice", supplierInvoiceSchema);

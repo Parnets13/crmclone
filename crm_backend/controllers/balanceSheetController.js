@@ -1,0 +1,1260 @@
+import { bankAccountSchema } from '../models/BankAccount.js';
+import { cashAccountSchema } from '../models/CashAccount.js';
+import { dealerLedgerSchema } from '../models/DealerLedger.js';
+import { supplierLedgerSchema } from '../models/SupplierLedger.js';
+import { stockMovementSchema } from '../models/Stock.js';
+import { grnSchema } from '../models/GRN.js';
+import { expenseSchema } from '../models/Expense.js';
+import { chequeSchema } from '../models/Cheque.js';
+import { capitalSchema } from '../models/Capital.js';
+import { loanSchema } from '../models/Loan.js';
+import { fixedAssetSchema } from '../models/FixedAsset.js';
+import { dealerInvoiceSchema } from '../models/DealerInvoice.js';
+import { supplierInvoiceSchema } from '../models/SupplierInvoice.js';
+import { journalVoucherSchema } from '../models/JournalVoucher.js';
+import { accountMasterSchema } from '../models/AccountMaster.js';
+import { financialYearClosingSchema } from '../models/FinancialYearClosing.js';
+import { getClosedPeriods, isPeriodLocked } from '../services/periodLockService.js';
+
+const getModels = (dbConnection) => {
+  return {
+    BankAccount: dbConnection.models.BankAccount || dbConnection.model('BankAccount', bankAccountSchema),
+    CashAccount: dbConnection.models.CashAccount || dbConnection.model('CashAccount', cashAccountSchema),
+    DealerLedger: dbConnection.models.DealerLedger || dbConnection.model('DealerLedger', dealerLedgerSchema),
+    SupplierLedger: dbConnection.models.SupplierLedger || dbConnection.model('SupplierLedger', supplierLedgerSchema),
+    StockMovement: dbConnection.models.StockMovement || dbConnection.model('StockMovement', stockMovementSchema),
+    GRN: dbConnection.models.GRN || dbConnection.model('GRN', grnSchema),
+    Expense: dbConnection.models.Expense || dbConnection.model('Expense', expenseSchema),
+    Cheque: dbConnection.models.Cheque || dbConnection.model('Cheque', chequeSchema),
+    Capital: dbConnection.models.Capital || dbConnection.model('Capital', capitalSchema),
+    Loan: dbConnection.models.Loan || dbConnection.model('Loan', loanSchema),
+    FixedAsset: dbConnection.models.FixedAsset || dbConnection.model('FixedAsset', fixedAssetSchema),
+    DealerInvoice: dbConnection.models.DealerInvoice || dbConnection.model('DealerInvoice', dealerInvoiceSchema),
+    SupplierInvoice: dbConnection.models.SupplierInvoice || dbConnection.model('SupplierInvoice', supplierInvoiceSchema),
+    JournalVoucher: dbConnection.models.JournalVoucher || dbConnection.model('JournalVoucher', journalVoucherSchema),
+    AccountMaster: dbConnection.models.AccountMaster || dbConnection.model('AccountMaster', accountMasterSchema),
+    FinancialYearClosing: dbConnection.models.FinancialYearClosing || dbConnection.model('FinancialYearClosing', financialYearClosingSchema)
+  };
+};
+
+// ─── financial year helpers (India: Apr 1 – Mar 31) ──────────────────────────
+
+/** "2025-26" -> Date(2025, 3, 1) i.e. 1 April 2025 */
+const getFYStartDate = (fy) => {
+  const startYear = parseInt(fy.split('-')[0], 10);
+  return new Date(startYear, 3, 1, 0, 0, 0, 0);
+};
+
+/** "2025-26" -> Date(2026, 2, 31 23:59:59) i.e. 31 March 2026 */
+const getFYEndDate = (fy) => {
+  const startYear = parseInt(fy.split('-')[0], 10);
+  return new Date(startYear + 1, 2, 31, 23, 59, 59, 999);
+};
+
+/** Date -> financial year string "2025-26" */
+const fyStringFromDate = (date) => {
+  const y = date.getFullYear();
+  const m = date.getMonth() + 1;
+  return m >= 4
+    ? `${y}-${(y + 1).toString().slice(2)}`
+    : `${y - 1}-${y.toString().slice(2)}`;
+};
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+const pct = (val, total) => (total > 0 ? ((val / total) * 100).toFixed(2) : '0.00');
+
+/**
+ * Weighted-average purchase cost per product from all GRNs up to reportDate.
+ * Returns Map<productId_string, avgCost>
+ */
+async function buildWeightedAvgCost(reportDate, dbConnection) {
+  const { GRN, StockMovement } = getModels(dbConnection);
+  const grns = await GRN.find({
+    grnDate: { $lte: reportDate },
+    status: { $nin: ['Cancelled'] }
+  }).lean();
+
+  const map = {}; // productId -> { totalQty, totalCost }
+  for (const grn of grns) {
+    for (const item of grn.items) {
+      const pid = item.productId.toString();
+      if (!map[pid]) map[pid] = { totalQty: 0, totalCost: 0 };
+      const costPerUnit = item.supplierCostPerUnit || item.unitPrice || 0;
+      const billQty = item.companyBillQuantity || item.acceptedQuantity || 0;
+      map[pid].totalQty += billQty;
+      map[pid].totalCost += billQty * costPerUnit;
+    }
+  }
+
+  // Fold in opening stock so valuation matches Tally's average-cost method
+  // (avg cost = total inward value / total inward qty, where opening balance
+  // is treated as the first inward). Only OPENING movements that carry a cost
+  // rate are included.
+  const openingMovements = await StockMovement.find({
+    referenceType: 'OPENING',
+    rate: { $ne: null },
+    date: { $lte: reportDate }
+  }).lean();
+  for (const mv of openingMovements) {
+    const pid = mv.productId.toString();
+    if (!map[pid]) map[pid] = { totalQty: 0, totalCost: 0 };
+    map[pid].totalQty += mv.quantity || 0;
+    map[pid].totalCost += (mv.quantity || 0) * (mv.rate || 0);
+  }
+
+  const result = {};
+  for (const [pid, v] of Object.entries(map)) {
+    result[pid] = v.totalQty > 0 ? v.totalCost / v.totalQty : 0;
+  }
+  return result;
+}
+
+/**
+ * Aggregate journal voucher entries by accountGroup up to reportDate.
+ * Returns { [accountGroup]: { debit, credit } }
+ */
+async function aggregateJournalEntries(reportDate, dbConnection) {
+  const { JournalVoucher } = getModels(dbConnection);
+  const vouchers = await JournalVoucher.find({
+    voucherDate: { $lte: reportDate },
+    status: 'Posted'
+  }).lean();
+
+  const result = {};
+  for (const v of vouchers) {
+    for (const e of v.entries) {
+      const g = e.accountGroup;
+      if (!result[g]) result[g] = { debit: 0, credit: 0 };
+      result[g].debit += e.debit || 0;
+      result[g].credit += e.credit || 0;
+    }
+  }
+  return result;
+}
+
+// ─── main controller ─────────────────────────────────────────────────────────
+
+// ─── core computation (reusable by generate + close) ─────────────────────────
+async function computeBalanceSheetData(req) {
+    const models = getModels(req.dbConnection);
+    const { CashAccount, BankAccount, DealerLedger, SupplierLedger, StockMovement, 
+            SupplierInvoice, DealerInvoice, Expense, Cheque, Capital, Loan, FixedAsset, AccountMaster,
+            FinancialYearClosing } = models;
+    const { asOfDate, financialYear } = req.query;
+    const reportDate = asOfDate ? new Date(asOfDate) : new Date();
+
+    // Determine the financial year being reported (from param or reportDate)
+    const reportFY = financialYear || fyStringFromDate(reportDate);
+    const fyStartDate = getFYStartDate(reportFY);
+
+    // Look up the most recent prior-year closing for opening balances / retained earnings
+    const priorClosing = await FinancialYearClosing.findOne({
+      fyEndDate: { $lt: fyStartDate },
+      status: 'Closed'
+    }).sort({ fyEndDate: -1 });
+    const priorRetainedEarnings = priorClosing?.retainedEarnings || 0;
+    const openingBalances = priorClosing?.closingBalances || null;
+
+    // ── 1. CASH & BANK ────────────────────────────────────────────────────────
+    const cashAccount = await CashAccount.getCashAccount();
+    const cashInHand = cashAccount?.currentBalance || 0;
+
+    const bankAccounts = await BankAccount.find({ isActive: true });
+    const bankBalances = bankAccounts.reduce((s, a) => s + (a.currentBalance || 0), 0);
+    const bankAccountDetails = bankAccounts.map(a => ({
+      accountName: a.accountName,
+      accountNumber: a.accountNumber,
+      bankName: a.bankName,
+      balance: a.currentBalance || 0
+    }));
+
+    // ── 2. ACCOUNTS RECEIVABLE ────────────────────────────────────────────────
+    const arAgg = await DealerLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, status: { $in: ['Active', 'Overdue'] } } },
+      { $group: { _id: '$dealer', debit: { $sum: '$debitAmount' }, credit: { $sum: '$creditAmount' } } },
+      { $project: { balance: { $subtract: ['$debit', '$credit'] } } },
+      { $match: { balance: { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$balance' } } }
+    ]);
+    const accountsReceivable = arAgg[0]?.total || 0;
+
+    // ── 3. ADVANCE TO SUPPLIERS ───────────────────────────────────────────────
+    const advSupAgg = await SupplierLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, transactionType: 'Advance Payment', status: 'Active' } },
+      { $group: { _id: null, total: { $sum: '$debitAmount' } } }
+    ]);
+    const advanceToSuppliers = advSupAgg[0]?.total || 0;
+
+    // ── 4. INVENTORY — weighted average cost from GRNs ────────────────────────
+    const avgCostMap = await buildWeightedAvgCost(reportDate, req.dbConnection);
+
+    const stockAgg = await StockMovement.aggregate([
+      { $match: { date: { $lte: reportDate } } },
+      { $sort: { date: -1, createdAt: -1 } },
+      { $group: { _id: { productId: '$productId', warehouseId: '$warehouseId' }, latestBalance: { $first: '$balance' } } },
+      { $match: { latestBalance: { $gt: 0 } } },
+      { $group: { _id: '$_id.productId', totalQty: { $sum: '$latestBalance' } } }
+    ]);
+
+    let inventoryValue = 0;
+    let inventoryQuantity = 0;
+    const inventoryBreakdown = [];
+    for (const row of stockAgg) {
+      const pid = row._id.toString();
+      const qty = row.totalQty;
+      const cost = avgCostMap[pid] || 0;
+      const val = qty * cost;
+      inventoryValue += val;
+      inventoryQuantity += qty;
+      inventoryBreakdown.push({ productId: pid, quantity: qty, avgCost: cost, value: val });
+    }
+
+    // ── 5. GST INPUT CREDIT (from supplier invoices) ──────────────────────────
+    const gstInputAgg = await SupplierInvoice.aggregate([
+      { $match: { invoiceDate: { $lte: reportDate }, status: { $nin: ['Cancelled'] } } },
+      { $group: { _id: null, totalGst: { $sum: '$totalGst' } } }
+    ]);
+    const gstInputCredit = gstInputAgg[0]?.totalGst || 0;
+
+    // ── 6. JOURNAL VOUCHER ADJUSTMENTS ────────────────────────────────────────
+    const jvGroups = await aggregateJournalEntries(reportDate, req.dbConnection);
+
+    // Real cash & bank come from the actual balance documents (Box A — the
+    // single source of truth, updated by the Voucher module). The generic
+    // "Cash Account"/"Bank Account" ledgers used by some auto-JVs live in the
+    // 'Current Assets' group too — counting them here would DOUBLE-COUNT cash.
+    // So we strip those two accounts out of the current-assets JV adjustment.
+    const { JournalVoucher } = getModels(req.dbConnection);
+    const cashBankJV = await JournalVoucher.aggregate([
+      { $match: { voucherDate: { $lte: reportDate }, status: 'Posted' } },
+      { $unwind: '$entries' },
+      { $match: {
+        'entries.accountGroup': 'Current Assets',
+        'entries.accountName': { $in: ['Cash Account', 'Bank Account'] }
+      }},
+      { $group: { _id: null, debit: { $sum: '$entries.debit' }, credit: { $sum: '$entries.credit' } } }
+    ]);
+    const jvCashBankNet = (cashBankJV[0]?.debit || 0) - (cashBankJV[0]?.credit || 0);
+
+    // Journal entries that affect current assets (Dr = increase asset),
+    // EXCLUDING the generic cash/bank ledgers (handled by Box A above).
+    const jvCurrentAssets = (jvGroups['Current Assets']?.debit || 0)
+      - (jvGroups['Current Assets']?.credit || 0) - jvCashBankNet;
+    // Opening stock from journal entries
+    const jvOpeningStock = (jvGroups['Fixed Assets']?.debit || 0) - (jvGroups['Fixed Assets']?.credit || 0);
+
+    // ── 7. FIXED ASSETS ───────────────────────────────────────────────────────
+    // Gross = purchase cost; Net = gross − accumulated depreciation (tracked on
+    // each asset, updated by the depreciation run). Depreciation JVs post to the
+    // 'Accumulated Depreciation' account, which is already reflected in the
+    // assets' accumulatedDepreciation — so we do NOT subtract it again here.
+    const fixedAssets = await FixedAsset.find({ status: 'Active', purchaseDate: { $lte: reportDate } });
+    const fixedAssetsGross = fixedAssets.reduce((s, a) => s + (a.purchaseValue || 0), 0);
+    const accumulatedDepreciation = fixedAssets.reduce((s, a) => s + (a.accumulatedDepreciation || 0), 0);
+    const netFixedAssets = fixedAssetsGross - accumulatedDepreciation + jvOpeningStock;
+
+    const fixedAssetsByCategory = fixedAssets.reduce((acc, a) => {
+      if (!acc[a.assetCategory]) acc[a.assetCategory] = { grossValue: 0, depreciation: 0, netValue: 0, count: 0 };
+      acc[a.assetCategory].grossValue += a.purchaseValue || 0;
+      acc[a.assetCategory].depreciation += a.accumulatedDepreciation || 0;
+      acc[a.assetCategory].netValue += (a.purchaseValue || 0) - (a.accumulatedDepreciation || 0);
+      acc[a.assetCategory].count += 1;
+      return acc;
+    }, {});
+
+    // ── TOTAL ASSETS ──────────────────────────────────────────────────────────
+    const totalCurrentAssets = cashInHand + bankBalances + accountsReceivable
+      + advanceToSuppliers + inventoryValue + gstInputCredit + jvCurrentAssets;
+    const totalAssets = totalCurrentAssets + netFixedAssets;
+
+    // ── 8. ACCOUNTS PAYABLE ───────────────────────────────────────────────────
+    // Supplier ledger convention: purchase invoice = debit, payment = credit,
+    // runningBalance = debit - credit (positive = WE owe the supplier).
+    // So payable = sum(debit) - sum(credit). (Previously this was reversed,
+    // which made Accounts Payable show as 0.)
+    const apAgg = await SupplierLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, status: { $in: ['Active', 'Overdue'] } } },
+      { $group: { _id: '$supplier', debit: { $sum: '$debitAmount' }, credit: { $sum: '$creditAmount' } } },
+      { $project: { balance: { $subtract: ['$debit', '$credit'] } } },
+      { $match: { balance: { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$balance' } } }
+    ]);
+    const accountsPayable = apAgg[0]?.total || 0;
+
+    // ── 9. ADVANCE FROM DEALERS ───────────────────────────────────────────────
+    const advDealerAgg = await DealerLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, transactionType: 'Advance Payment', status: 'Active' } },
+      { $group: { _id: null, total: { $sum: '$creditAmount' } } }
+    ]);
+    const advanceFromDealers = advDealerAgg[0]?.total || 0;
+
+    // ── 10. GST PAYABLE (collected on sales - input credit) ───────────────────
+    const gstSalesAgg = await DealerInvoice.aggregate([
+      { $match: {
+        invoiceDate: { $lte: reportDate },
+        status: { $nin: ['Cancelled', 'Draft'] },
+        isDraft: false,
+        isDeleted: { $ne: true }
+      }},
+      { $group: { _id: null, totalGst: { $sum: '$totalGst' } } }
+    ]);
+    const gstCollected = gstSalesAgg[0]?.totalGst || 0;
+    // GST Payable = gross GST collected on sales (output tax).
+    // GST input credit from purchases is shown SEPARATELY as a current asset,
+    // so we must NOT net it here (that would double-count). Add JV GST adjustments.
+    const jvGstPayable = (jvGroups['GST Payable']?.credit || 0) - (jvGroups['GST Payable']?.debit || 0);
+    const gstPayable = Math.max(0, gstCollected + jvGstPayable);
+
+    // ── 11. OUTSTANDING EXPENSES ──────────────────────────────────────────────
+    const pendingExpAgg = await Expense.aggregate([
+      { $match: { date: { $lte: reportDate }, status: 'pending' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const pendingExpenses = pendingExpAgg[0]?.total || 0;
+
+    // ── 12. (REMOVED) CHEQUES ─────────────────────────────────────────────────
+    // The Cheque register tracks cheques RECEIVED from dealers (incoming payments).
+    // Those are NOT a liability — the dealer's payment is already captured in
+    // Accounts Receivable (and in bank/cash once cleared) through the payment flow.
+    // Including them here was a phantom double-count, so it has been removed.
+
+    // ── 13. JOURNAL LIABILITIES ───────────────────────────────────────────────
+    const jvCurrentLiabilities = (jvGroups['Current Liabilities']?.credit || 0) - (jvGroups['Current Liabilities']?.debit || 0);
+    const jvLoansLiabilities = (jvGroups['Loans & Liabilities']?.credit || 0) - (jvGroups['Loans & Liabilities']?.debit || 0);
+
+    const totalCurrentLiabilities = accountsPayable + advanceFromDealers + gstPayable
+      + pendingExpenses + jvCurrentLiabilities;
+
+    // ── 14. LOANS ─────────────────────────────────────────────────────────────
+    const loans = await Loan.find({ status: { $in: ['Active', 'Overdue'] }, disbursementDate: { $lte: reportDate } });
+    const totalLoans = loans.reduce((s, l) => s + (l.totalOutstanding || 0), 0) + jvLoansLiabilities;
+    const loansByType = loans.reduce((acc, l) => {
+      if (!acc[l.loanType]) acc[l.loanType] = { principal: 0, interest: 0, total: 0, count: 0 };
+      acc[l.loanType].principal += l.outstandingPrincipal || 0;
+      acc[l.loanType].interest += l.outstandingInterest || 0;
+      acc[l.loanType].total += l.totalOutstanding || 0;
+      acc[l.loanType].count += 1;
+      return acc;
+    }, {});
+
+    const totalLiabilities = totalCurrentLiabilities + totalLoans;
+
+    // ── 15. CAPITAL ───────────────────────────────────────────────────────────
+    // From Capital model (existing)
+    const capitalDocs = await Capital.find(financialYear ? { financialYear } : {});
+    const capitalFromModel = capitalDocs.reduce((s, c) => s + (c.currentBalance || 0), 0);
+
+    // From AccountMaster opening balances (Capital group)
+    const capitalAccounts = await AccountMaster.find({ accountGroup: 'Capital', isActive: true });
+    const capitalFromMaster = capitalAccounts.reduce((s, a) => {
+      const bal = a.openingBalance || 0;
+      return s + (a.openingBalanceType === 'Cr' ? bal : -bal);
+    }, 0);
+
+    // Journal entries affecting Capital
+    const jvCapital = (jvGroups['Capital']?.credit || 0) - (jvGroups['Capital']?.debit || 0);
+    const jvReserves = (jvGroups['Reserves & Surplus']?.credit || 0) - (jvGroups['Reserves & Surplus']?.debit || 0);
+
+    const totalCapital = capitalFromModel + capitalFromMaster + jvCapital + jvReserves;
+
+    // ── 16. PROFIT / LOSS ─────────────────────────────────────────────────────
+    // Revenue = NET TAXABLE sales (GST-EXCLUSIVE).
+    // Dealer invoice subtotal is MRP×qty (GST INCLUSIVE), so we subtract GST collected
+    // to get the taxable value. GST portion is booked separately under GST Payable.
+    // Only count approved invoices (not drafts, not deleted, not cancelled)
+    const revenueAgg = await DealerInvoice.aggregate([
+      { $match: {
+        invoiceDate: { $lte: reportDate },
+        status: { $nin: ['Cancelled', 'Draft'] },
+        isDraft: false,
+        isDeleted: { $ne: true }
+      }},
+      { $group: { _id: null, subtotal: { $sum: '$subtotal' }, totalDiscount: { $sum: '$totalDiscount' } } }
+    ]);
+    // netSalesInclGst = MRP-based sales after discount (GST inclusive)
+    const netSalesInclGst = (revenueAgg[0]?.subtotal || 0) - (revenueAgg[0]?.totalDiscount || 0);
+    // Subtract GST to get GST-exclusive taxable revenue for P&L
+    const netSales = netSalesInclGst - gstCollected;
+
+    // Cost of Goods SOLD (not total purchases):
+    //   COGS = Opening Stock + Net Purchases (GST-excl) − Closing Inventory
+    // Supplier invoice subtotal is GST-EXCLUSIVE (base cost).
+    const costAgg = await SupplierInvoice.aggregate([
+      { $match: {
+        invoiceDate: { $lte: reportDate },
+        status: { $nin: ['Cancelled'] }
+      }},
+      { $group: { _id: null, subtotal: { $sum: '$subtotal' }, totalDiscount: { $sum: '$totalDiscount' } } }
+    ]);
+    const netPurchases = (costAgg[0]?.subtotal || 0) - (costAgg[0]?.totalDiscount || 0);
+    // Closing inventory (inventoryValue) is held as an asset; subtract it so it
+    // is not double-counted as both an asset and an expense.
+    // (Opening stock is assumed 0 / carried in inventoryValue baseline.)
+    const costOfGoods = netPurchases - inventoryValue;
+
+    // Approved expenses
+    const expAgg = await Expense.aggregate([
+      { $match: { date: { $lte: reportDate }, status: 'approved' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const totalExpenses = expAgg[0]?.total || 0;
+
+    // Journal income/expense adjustments
+    const jvSales = (jvGroups['Sales']?.credit || 0) - (jvGroups['Sales']?.debit || 0);
+    const jvPurchase = (jvGroups['Purchase']?.debit || 0) - (jvGroups['Purchase']?.credit || 0);
+    const jvDirectExp = (jvGroups['Direct Expenses']?.debit || 0) - (jvGroups['Direct Expenses']?.credit || 0);
+    const jvIndirectExp = (jvGroups['Indirect Expenses']?.debit || 0) - (jvGroups['Indirect Expenses']?.credit || 0);
+
+    const totalRevenue = netSales + jvSales;
+    const totalCost = costOfGoods + jvPurchase;
+    const grossProfit = totalRevenue - totalCost;
+    const profitLoss = grossProfit - totalExpenses - jvDirectExp - jvIndirectExp;
+
+    // Split cumulative profit into prior-year Retained Earnings + Current-year P&L.
+    // Total equity is unchanged (capital + cumulative profit) so the sheet still balances.
+    // priorRetainedEarnings comes from the most recent closed financial year (0 if none closed).
+    const retainedEarnings = priorRetainedEarnings;
+    const currentYearProfitLoss = profitLoss - priorRetainedEarnings;
+
+    const totalEquity = totalCapital + retainedEarnings + currentYearProfitLoss;
+
+    // ── BALANCE CHECK ─────────────────────────────────────────────────────────
+    const balanceDifference = totalAssets - (totalLiabilities + totalEquity);
+    const isBalanced = Math.abs(balanceDifference) < 1;
+
+    // ── RESPONSE ──────────────────────────────────────────────────────────────
+    return {
+        reportDate,
+        financialYear: reportFY,
+        fyStartDate,
+        generatedAt: new Date(),
+        generatedBy: req.user?._id,
+
+        // Opening balances carried forward from the prior closed financial year (null if none)
+        openingBalances: openingBalances ? {
+          ...openingBalances,
+          fromFinancialYear: priorClosing.financialYear,
+          closingDate: priorClosing.fyEndDate
+        } : null,
+
+        assets: {
+          currentAssets: {
+            cashInHand:          { amount: cashInHand,          pct: pct(cashInHand, totalAssets) },
+            bankBalances:        { amount: bankBalances,         pct: pct(bankBalances, totalAssets), details: bankAccountDetails },
+            accountsReceivable:  { amount: accountsReceivable,  pct: pct(accountsReceivable, totalAssets) },
+            advanceToSuppliers:  { amount: advanceToSuppliers,  pct: pct(advanceToSuppliers, totalAssets) },
+            inventory:           { amount: inventoryValue,       quantity: inventoryQuantity, pct: pct(inventoryValue, totalAssets), breakdown: inventoryBreakdown },
+            gstInputCredit:      { amount: gstInputCredit,       pct: pct(gstInputCredit, totalAssets) },
+            journalAdjustments:  { amount: jvCurrentAssets,      pct: pct(jvCurrentAssets, totalAssets) },
+            total: totalCurrentAssets
+          },
+          fixedAssets: {
+            grossValue: fixedAssetsGross,
+            accumulatedDepreciation,
+            netValue: netFixedAssets,
+            pct: pct(netFixedAssets, totalAssets),
+            byCategory: fixedAssetsByCategory
+          },
+          totalAssets
+        },
+
+        liabilities: {
+          currentLiabilities: {
+            accountsPayable:     { amount: accountsPayable,     pct: pct(accountsPayable, totalLiabilities) },
+            advanceFromDealers:  { amount: advanceFromDealers,  pct: pct(advanceFromDealers, totalLiabilities) },
+            gstPayable:          { amount: gstPayable,           pct: pct(gstPayable, totalLiabilities), gstCollected, gstInputCredit },
+            outstandingExpenses: { amount: pendingExpenses,      pct: pct(pendingExpenses, totalLiabilities) },
+            journalAdjustments:  { amount: jvCurrentLiabilities, pct: pct(jvCurrentLiabilities, totalLiabilities) },
+            total: totalCurrentLiabilities
+          },
+          longTermLiabilities: {
+            loans: { amount: totalLoans, pct: pct(totalLoans, totalLiabilities), byType: loansByType },
+            total: totalLoans
+          },
+          totalLiabilities
+        },
+
+        equity: {
+          capital: {
+            amount: totalCapital,
+            fromCapitalModel: capitalFromModel,
+            fromAccountMaster: capitalFromMaster,
+            journalAdjustments: jvCapital + jvReserves,
+            accounts: capitalDocs.map(c => ({ ownerName: c.ownerName, type: c.capitalType, balance: c.currentBalance }))
+          },
+          retainedEarnings: {
+            amount: retainedEarnings,
+            fromFinancialYear: priorClosing?.financialYear || null,
+            note: priorClosing
+              ? `Accumulated profit carried forward from ${priorClosing.financialYear}`
+              : 'No prior year closed — retained earnings is 0'
+          },
+          profitLoss: {
+            amount: currentYearProfitLoss,
+            cumulativeProfitLoss: profitLoss,
+            netSales: totalRevenue,
+            costOfGoods: totalCost,
+            grossProfit,
+            expenses: totalExpenses + jvDirectExp + jvIndirectExp,
+            breakdown: {
+              salesRevenue: netSales,
+              journalSalesAdj: jvSales,
+              purchaseCost: costOfGoods,
+              journalPurchaseAdj: jvPurchase,
+              approvedExpenses: totalExpenses,
+              directExpenses: jvDirectExp,
+              indirectExpenses: jvIndirectExp
+            }
+          },
+          totalEquity
+        },
+
+        summary: {
+          totalAssets,
+          totalLiabilities,
+          totalEquity,
+          balanceDifference,
+          isBalanced
+        },
+
+        ratios: {
+          currentRatio:       totalCurrentLiabilities > 0 ? (totalCurrentAssets / totalCurrentLiabilities).toFixed(2) : 'N/A',
+          debtToEquityRatio:  totalEquity > 0 ? (totalLiabilities / totalEquity).toFixed(2) : 'N/A',
+          debtToAssetRatio:   totalAssets > 0 ? (totalLiabilities / totalAssets * 100).toFixed(2) : '0.00',
+          equityRatio:        totalAssets > 0 ? (totalEquity / totalAssets * 100).toFixed(2) : '0.00',
+          grossProfitMargin:  totalRevenue > 0 ? (grossProfit / totalRevenue * 100).toFixed(2) : '0.00',
+          netProfitMargin:    totalRevenue > 0 ? (profitLoss / totalRevenue * 100).toFixed(2) : '0.00'
+        }
+      };
+}
+
+// ─── Express handler: generate balance sheet ─────────────────────────────────
+export const generateBalanceSheet = async (req, res) => {
+  try {
+    const data = await computeBalanceSheetData(req);
+    res.status(200).json({ success: true, message: 'Balance sheet generated successfully', data });
+  } catch (error) {
+    console.error('❌ Balance sheet error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate balance sheet',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+// ─── Close a financial year (snapshot closing balances → next year opening) ──
+export const closeFinancialYear = async (req, res) => {
+  try {
+    const { FinancialYearClosing } = getModels(req.dbConnection);
+    const { financialYear } = req.body;
+
+    if (!financialYear || !/^\d{4}-\d{2}$/.test(financialYear)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid financialYear is required, e.g. "2025-26"'
+      });
+    }
+
+    // Prevent double-closing
+    const existing = await FinancialYearClosing.findOne({ financialYear });
+    if (existing && existing.status === 'Closed') {
+      return res.status(400).json({
+        success: false,
+        message: `Financial year ${financialYear} is already closed. Reopen it first to recalculate.`
+      });
+    }
+
+    const fyEndDate = getFYEndDate(financialYear);
+
+    // Compute the balance sheet AS OF the FY end date
+    const data = await computeBalanceSheetData({
+      dbConnection: req.dbConnection,
+      user: req.user,
+      query: { asOfDate: fyEndDate.toISOString(), financialYear }
+    });
+
+    // Cumulative profit up to FY end (this is the new retained earnings)
+    const retainedEarnings = data.equity.profitLoss.cumulativeProfitLoss;
+    // This year's own profit = retained now − retained before this year
+    const netProfit = data.equity.profitLoss.amount;
+
+    const closingPayload = {
+      financialYear,
+      fyStartDate: getFYStartDate(financialYear),
+      fyEndDate,
+      netProfit,
+      retainedEarnings,
+      closingBalances: {
+        cashInHand:         data.assets.currentAssets.cashInHand.amount,
+        bankBalances:       data.assets.currentAssets.bankBalances.amount,
+        accountsReceivable: data.assets.currentAssets.accountsReceivable.amount,
+        accountsPayable:    data.liabilities.currentLiabilities.accountsPayable.amount,
+        inventory:          data.assets.currentAssets.inventory.amount,
+        fixedAssets:        data.assets.fixedAssets.netValue,
+        capital:            data.equity.capital.amount,
+        gstPayable:         data.liabilities.currentLiabilities.gstPayable.amount,
+        loans:              data.liabilities.longTermLiabilities.loans.amount
+      },
+      snapshot: data,
+      status: 'Closed',
+      closedBy: req.user?._id,
+      closedAt: new Date(),
+      notes: req.body.notes || ''
+    };
+
+    let closing;
+    if (existing) {
+      // Re-close a previously reopened year (keeps the same record for audit)
+      Object.assign(existing, closingPayload);
+      existing.reopenedBy = undefined;
+      existing.reopenedAt = undefined;
+      existing.reopenReason = undefined;
+      closing = await existing.save();
+    } else {
+      closing = await FinancialYearClosing.create(closingPayload);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `Financial year ${financialYear} closed successfully`,
+      data: {
+        financialYear: closing.financialYear,
+        netProfit: closing.netProfit,
+        retainedEarnings: closing.retainedEarnings,
+        closingBalances: closing.closingBalances,
+        isBalanced: data.summary.isBalanced,
+        balanceDifference: data.summary.balanceDifference
+      }
+    });
+  } catch (error) {
+    console.error('❌ Close financial year error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to close financial year',
+      error: error.message
+    });
+  }
+};
+
+// ─── List all financial year closings ────────────────────────────────────────
+export const getFinancialYearClosings = async (req, res) => {
+  try {
+    const { FinancialYearClosing } = getModels(req.dbConnection);
+    const closings = await FinancialYearClosing.find()
+      .sort({ fyEndDate: -1 })
+      .select('-snapshot')   // exclude bulky snapshot from list
+      .populate('closedBy', 'name email');
+    res.status(200).json({ success: true, data: closings });
+  } catch (error) {
+    console.error('❌ Get financial year closings error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch closings', error: error.message });
+  }
+};
+
+// ─── Reopen a closed financial year (super admin) ────────────────────────────
+export const reopenFinancialYear = async (req, res) => {
+  try {
+    const { FinancialYearClosing } = getModels(req.dbConnection);
+    const { financialYear } = req.params;
+
+    const closing = await FinancialYearClosing.findOne({ financialYear, status: 'Closed' });
+    if (!closing) {
+      return res.status(404).json({ success: false, message: `No closed record found for ${financialYear}` });
+    }
+
+    // Block reopening if a later year is already closed (must reopen in reverse order)
+    const laterClosed = await FinancialYearClosing.findOne({
+      fyStartDate: { $gt: closing.fyStartDate },
+      status: 'Closed'
+    });
+    if (laterClosed) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot reopen ${financialYear} — a later year (${laterClosed.financialYear}) is still closed. Reopen the latest year first.`
+      });
+    }
+
+    // Mark as reopened (keep the record for audit instead of deleting)
+    closing.status = 'Reopened';
+    closing.reopenedBy = req.user?._id;
+    closing.reopenedAt = new Date();
+    closing.reopenReason = req.body?.reopenReason || req.body?.reason || '';
+    await closing.save();
+
+    res.status(200).json({
+      success: true,
+      message: `Financial year ${financialYear} reopened. The period is now editable; re-close it to recalculate.`
+    });
+  } catch (error) {
+    console.error('❌ Reopen financial year error:', error);
+    res.status(500).json({ success: false, message: 'Failed to reopen financial year', error: error.message });
+  }
+};
+
+// ─── Period lock status (for the frontend to warn before submitting) ─────────
+export const getPeriodStatus = async (req, res) => {
+  try {
+    const { date } = req.query;
+    const closedPeriods = await getClosedPeriods(req.dbConnection);
+    let locked = false;
+    if (date) {
+      locked = await isPeriodLocked(req.dbConnection, date);
+    }
+    res.status(200).json({
+      success: true,
+      data: {
+        date: date || null,
+        locked,
+        closedPeriods,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Get period status error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch period status', error: error.message });
+  }
+};
+
+export const getBalanceSheetComparison = async (req, res) => {
+  res.status(200).json({ success: true, message: 'Comparison not yet implemented', data: {} });};
+
+export const exportBalanceSheet = async (req, res) => {
+  res.status(200).json({ success: true, message: 'Export not yet implemented', data: {} });
+};
+
+// ─── V2: Hierarchical Balance Sheet with Drill-down (Schedule III Div I) ─────
+
+export const getBalanceSheetV2 = async (req, res) => {
+  try {
+    const models = getModels(req.dbConnection);
+    const { CashAccount, BankAccount, DealerLedger, SupplierLedger, StockMovement,
+            SupplierInvoice, DealerInvoice, Expense, Capital, Loan, FixedAsset,
+            AccountMaster, JournalVoucher } = models;
+
+    const { date, drill, drillId } = req.query;
+    const reportDate = date ? new Date(date) : new Date();
+    const reportFY = fyStringFromDate(reportDate);
+
+    // ── If drillId is provided along with drill, return transaction-level detail ──
+    if (drill && drillId) {
+      const drillData = await getDrillIdDetail(drill, drillId, reportDate, models);
+      return res.status(200).json({ success: true, drillData });
+    }
+
+    // ── If drill param provided, return breakdown for that category ──
+    if (drill) {
+      const drillData = await getDrillBreakdown(drill, reportDate, models, req.dbConnection);
+      return res.status(200).json({ success: true, drillData });
+    }
+
+    // ── Full hierarchical balance sheet ──────────────────────────────────────
+
+    // 1. CASH & BANK
+    const cashAccount = await CashAccount.getCashAccount();
+    const cashInHand = cashAccount?.currentBalance || 0;
+
+    const bankAccounts = await BankAccount.find({ isActive: true });
+    const bankBalances = bankAccounts.reduce((s, a) => s + (a.currentBalance || 0), 0);
+
+    // 2. TRADE RECEIVABLES (Sundry Debtors) - dealers who owe us
+    const arAgg = await DealerLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, status: { $in: ['Active', 'Overdue'] } } },
+      { $group: { _id: '$dealer', debit: { $sum: '$debitAmount' }, credit: { $sum: '$creditAmount' } } },
+      { $project: { balance: { $subtract: ['$debit', '$credit'] } } },
+      { $match: { balance: { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$balance' } } }
+    ]);
+    const tradeReceivables = arAgg[0]?.total || 0;
+
+    // 3. ADVANCE TO SUPPLIERS
+    const advSupAgg = await SupplierLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, transactionType: 'Advance Payment', status: 'Active' } },
+      { $group: { _id: null, total: { $sum: '$debitAmount' } } }
+    ]);
+    const advanceToSuppliers = advSupAgg[0]?.total || 0;
+
+    // 4. INVENTORY (weighted average cost)
+    const avgCostMap = await buildWeightedAvgCost(reportDate, req.dbConnection);
+    const stockAgg = await StockMovement.aggregate([
+      { $match: { date: { $lte: reportDate } } },
+      { $sort: { date: -1, createdAt: -1 } },
+      { $group: { _id: { productId: '$productId', warehouseId: '$warehouseId' }, latestBalance: { $first: '$balance' } } },
+      { $match: { latestBalance: { $gt: 0 } } },
+      { $group: { _id: '$_id.productId', totalQty: { $sum: '$latestBalance' } } }
+    ]);
+    let inventoryValue = 0;
+    for (const row of stockAgg) {
+      const pid = row._id.toString();
+      inventoryValue += row.totalQty * (avgCostMap[pid] || 0);
+    }
+
+    // 5. GST INPUT CREDIT
+    const gstInputAgg = await SupplierInvoice.aggregate([
+      { $match: { invoiceDate: { $lte: reportDate }, status: { $nin: ['Cancelled'] } } },
+      { $group: { _id: null, totalGst: { $sum: '$totalGst' } } }
+    ]);
+    const gstInputCredit = gstInputAgg[0]?.totalGst || 0;
+
+    // 6. FIXED ASSETS (Net)
+    const fixedAssets = await FixedAsset.find({ status: 'Active', purchaseDate: { $lte: reportDate } });
+    const fixedAssetsGross = fixedAssets.reduce((s, a) => s + (a.purchaseValue || 0), 0);
+    const accumulatedDepreciation = fixedAssets.reduce((s, a) => s + (a.accumulatedDepreciation || 0), 0);
+    const netFixedAssets = fixedAssetsGross - accumulatedDepreciation;
+
+    // ── TOTAL ASSETS
+    const totalCurrentAssets = cashInHand + bankBalances + tradeReceivables + advanceToSuppliers + inventoryValue + gstInputCredit;
+    const totalAssets = totalCurrentAssets + netFixedAssets;
+
+    // 7. TRADE PAYABLES (Sundry Creditors) - we owe suppliers
+    const apAgg = await SupplierLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, status: { $in: ['Active', 'Overdue'] } } },
+      { $group: { _id: '$supplier', debit: { $sum: '$debitAmount' }, credit: { $sum: '$creditAmount' } } },
+      { $project: { balance: { $subtract: ['$debit', '$credit'] } } },
+      { $match: { balance: { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$balance' } } }
+    ]);
+    const tradePayables = apAgg[0]?.total || 0;
+
+    // 8. ADVANCE FROM DEALERS
+    const advDealerAgg = await DealerLedger.aggregate([
+      { $match: { entryDate: { $lte: reportDate }, transactionType: 'Advance Payment', status: 'Active' } },
+      { $group: { _id: null, total: { $sum: '$creditAmount' } } }
+    ]);
+    const advanceFromDealers = advDealerAgg[0]?.total || 0;
+
+    // 9. GST PAYABLE
+    const gstSalesAgg = await DealerInvoice.aggregate([
+      { $match: { invoiceDate: { $lte: reportDate }, status: { $nin: ['Cancelled', 'Draft'] }, isDraft: false, isDeleted: { $ne: true } } },
+      { $group: { _id: null, totalGst: { $sum: '$totalGst' } } }
+    ]);
+    const gstPayable = Math.max(0, gstSalesAgg[0]?.totalGst || 0);
+
+    // 10. OTHER CURRENT LIABILITIES (outstanding expenses)
+    const pendingExpAgg = await Expense.aggregate([
+      { $match: { date: { $lte: reportDate }, status: 'pending' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const otherCurrentLiab = pendingExpAgg[0]?.total || 0;
+
+    const totalCurrentLiabilities = tradePayables + advanceFromDealers + gstPayable + otherCurrentLiab;
+
+    // 11. LOANS (Non-Current Liabilities)
+    const loans = await Loan.find({ status: { $in: ['Active', 'Overdue'] }, disbursementDate: { $lte: reportDate } });
+    const totalLoans = loans.reduce((s, l) => s + (l.totalOutstanding || 0), 0);
+
+    const totalLiabilities = totalCurrentLiabilities + totalLoans;
+
+    // 12. CAPITAL (Equity)
+    const capitalDocs = await Capital.find({});
+    const capitalFromModel = capitalDocs.reduce((s, c) => s + (c.currentBalance || 0), 0);
+    const capitalAccounts = await AccountMaster.find({ accountGroup: 'Capital', isActive: true });
+    const capitalFromMaster = capitalAccounts.reduce((s, a) => {
+      const bal = a.openingBalance || 0;
+      return s + (a.openingBalanceType === 'Cr' ? bal : -bal);
+    }, 0);
+    const totalCapital = capitalFromModel + capitalFromMaster;
+
+    // 13. P&L (for net worth / retained earnings)
+    const revenueAgg = await DealerInvoice.aggregate([
+      { $match: { invoiceDate: { $lte: reportDate }, status: { $nin: ['Cancelled', 'Draft'] }, isDraft: false, isDeleted: { $ne: true } } },
+      { $group: { _id: null, totalAmount: { $sum: '$totalAmount' }, subtotal: { $sum: '$subtotal' }, totalDiscount: { $sum: '$totalDiscount' } } }
+    ]);
+    const netSales = revenueAgg[0]?.totalAmount || 0;
+
+    const costAgg = await SupplierInvoice.aggregate([
+      { $match: { invoiceDate: { $lte: reportDate }, status: { $nin: ['Cancelled'] } } },
+      { $group: { _id: null, total: { $sum: { $ifNull: ['$supplierBilledTotal', '$totalAmount'] } } } }
+    ]);
+    const costOfGoods = costAgg[0]?.total || 0;
+
+    const expAgg = await Expense.aggregate([
+      { $match: { date: { $lte: reportDate }, status: 'approved' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const totalExpenses = expAgg[0]?.total || 0;
+
+    const grossProfit = netSales - costOfGoods;
+    const netProfit = grossProfit - totalExpenses;
+
+    const totalEquity = totalCapital + netProfit;
+    const netWorth = totalEquity;
+
+    // ── KEY FINANCIAL RATIOS ─────────────────────────────────────────────────
+    // Computed here (not in the client) so every screen and export shows the same
+    // numbers, and so ratios use the correct bases. Returns null when the
+    // denominator is zero rather than a misleading 0 or Infinity.
+    const safeRatio = (numerator, denominator) =>
+      denominator ? Number((numerator / denominator).toFixed(2)) : null;
+    const safePct = (numerator, denominator) =>
+      denominator ? Number(((numerator / denominator) * 100).toFixed(2)) : null;
+
+    const ratios = {
+      // Current Ratio = current assets / current liabilities (NOT total assets / total liabilities)
+      currentRatio: safeRatio(totalCurrentAssets, totalCurrentLiabilities),
+      // Quick Ratio = (current assets - inventory) / current liabilities
+      quickRatio: safeRatio(totalCurrentAssets - inventoryValue, totalCurrentLiabilities),
+      debtEquityRatio: safeRatio(totalLiabilities, totalEquity),
+      workingCapital: totalCurrentAssets - totalCurrentLiabilities,
+      grossMarginPct: safePct(grossProfit, netSales),
+      netMarginPct: safePct(netProfit, netSales),
+      equityRatioPct: safePct(totalEquity, totalAssets)
+    };
+
+    // ── BUILD RESPONSE ───────────────────────────────────────────────────────
+    const response = {
+      success: true,
+      reportDate: reportDate.toISOString().split('T')[0],
+      financialYear: reportFY,
+      summary: {
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        netWorth,
+        totalCurrentAssets,
+        totalCurrentLiabilities,
+        totalNonCurrentAssets: netFixedAssets,
+        totalNonCurrentLiabilities: totalLoans,
+        inventoryValue
+      },
+      ratios,
+      equityAndLiabilities: {
+        total: totalLiabilities + totalEquity,
+        groups: [
+          {
+            name: 'Capital Account',
+            key: 'capital',
+            amount: totalCapital,
+            drillable: true,
+            children: []
+          },
+          {
+            name: 'Current Liabilities',
+            key: 'currentLiabilities',
+            amount: totalCurrentLiabilities,
+            drillable: true,
+            children: [
+              { name: 'Trade Payables (Sundry Creditors)', key: 'tradePayables', amount: tradePayables, drillable: true },
+              { name: 'GST Payable', key: 'gstPayable', amount: gstPayable, drillable: true },
+              { name: 'Advance from Dealers', key: 'advanceFromDealers', amount: advanceFromDealers, drillable: false },
+              { name: 'Other Current Liabilities', key: 'otherCurrentLiab', amount: otherCurrentLiab, drillable: false }
+            ]
+          },
+          {
+            name: 'Non-Current Liabilities',
+            key: 'nonCurrentLiabilities',
+            amount: totalLoans,
+            drillable: true,
+            children: [
+              { name: 'Loans', key: 'loans', amount: totalLoans, drillable: true }
+            ]
+          }
+        ]
+      },
+      assets: {
+        total: totalAssets,
+        groups: [
+          {
+            name: 'Current Assets',
+            key: 'currentAssets',
+            amount: totalCurrentAssets,
+            drillable: true,
+            children: [
+              { name: 'Cash in Hand', key: 'cashInHand', amount: cashInHand, drillable: false },
+              { name: 'Bank Balances', key: 'bankBalances', amount: bankBalances, drillable: true },
+              { name: 'Inventories (Stock-in-Hand)', key: 'inventories', amount: inventoryValue, drillable: true },
+              { name: 'Trade Receivables (Sundry Debtors)', key: 'tradeReceivables', amount: tradeReceivables, drillable: true },
+              { name: 'GST Input Credit', key: 'gstInputCredit', amount: gstInputCredit, drillable: false },
+              { name: 'Advance to Suppliers', key: 'advanceToSuppliers', amount: advanceToSuppliers, drillable: false }
+            ]
+          },
+          {
+            name: 'Non-Current Assets',
+            key: 'nonCurrentAssets',
+            amount: netFixedAssets,
+            drillable: true,
+            children: [
+              { name: 'Fixed Assets (Net)', key: 'fixedAssets', amount: netFixedAssets, drillable: true }
+            ]
+          }
+        ]
+      },
+      profitAndLoss: {
+        netSales,
+        costOfGoods,
+        grossProfit,
+        expenses: totalExpenses,
+        netProfit
+      },
+      drillData: null
+    };
+
+    res.status(200).json(response);
+  } catch (error) {
+    console.error('❌ Balance Sheet V2 error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate balance sheet',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+// ─── Drill breakdown helpers ─────────────────────────────────────────────────
+
+async function getDrillBreakdown(drill, reportDate, models, dbConnection) {
+  const { SupplierLedger, DealerLedger, BankAccount, StockMovement, FixedAsset, Loan } = models;
+
+  switch (drill) {
+    case 'tradePayables': {
+      // List of suppliers with outstanding balances
+      const agg = await SupplierLedger.aggregate([
+        { $match: { entryDate: { $lte: reportDate }, status: { $in: ['Active', 'Overdue'] } } },
+        { $group: {
+          _id: '$supplier',
+          supplierName: { $first: '$supplierName' },
+          debit: { $sum: '$debitAmount' },
+          credit: { $sum: '$creditAmount' }
+        }},
+        { $project: { supplierId: '$_id', supplierName: 1, balance: { $subtract: ['$debit', '$credit'] } } },
+        { $match: { balance: { $gt: 0 } } },
+        { $sort: { balance: -1 } }
+      ]);
+      return {
+        drill: 'tradePayables',
+        label: 'Trade Payables - Supplier Breakdown',
+        items: agg.map(r => ({
+          id: r._id,
+          name: r.supplierName || 'Unknown Supplier',
+          amount: r.balance,
+          drillable: true
+        }))
+      };
+    }
+
+    case 'tradeReceivables': {
+      // List of dealers with outstanding balances
+      const agg = await DealerLedger.aggregate([
+        { $match: { entryDate: { $lte: reportDate }, status: { $in: ['Active', 'Overdue'] } } },
+        { $group: {
+          _id: '$dealer',
+          dealerName: { $first: '$dealerName' },
+          debit: { $sum: '$debitAmount' },
+          credit: { $sum: '$creditAmount' }
+        }},
+        { $project: { dealerId: '$_id', dealerName: 1, balance: { $subtract: ['$debit', '$credit'] } } },
+        { $match: { balance: { $gt: 0 } } },
+        { $sort: { balance: -1 } }
+      ]);
+      return {
+        drill: 'tradeReceivables',
+        label: 'Trade Receivables - Dealer Breakdown',
+        items: agg.map(r => ({
+          id: r._id,
+          name: r.dealerName || 'Unknown Dealer',
+          amount: r.balance,
+          drillable: true
+        }))
+      };
+    }
+
+    case 'bankBalances': {
+      // List of bank accounts with balances
+      const banks = await BankAccount.find({ isActive: true }).lean();
+      return {
+        drill: 'bankBalances',
+        label: 'Bank Balances - Account Breakdown',
+        items: banks.map(b => ({
+          id: b._id,
+          name: `${b.bankName} - ${b.accountName} (${b.accountNumber})`,
+          amount: b.currentBalance || 0,
+          drillable: false
+        }))
+      };
+    }
+
+    case 'inventories': {
+      // List of products with stock value (weighted avg cost from GRN)
+      const avgCostMap = await buildWeightedAvgCost(reportDate, dbConnection);
+      const stockAgg = await StockMovement.aggregate([
+        { $match: { date: { $lte: reportDate } } },
+        { $sort: { date: -1, createdAt: -1 } },
+        { $group: { _id: { productId: '$productId', warehouseId: '$warehouseId' }, latestBalance: { $first: '$balance' } } },
+        { $match: { latestBalance: { $gt: 0 } } },
+        { $group: { _id: '$_id.productId', totalQty: { $sum: '$latestBalance' } } }
+      ]);
+
+      // Lookup product names
+      const Product = dbConnection.models.Product || dbConnection.model('Product', (await import('../models/Product.js')).productSchema);
+      const productIds = stockAgg.map(r => r._id);
+      const products = await Product.find({ _id: { $in: productIds } }).select('itemName productCode').lean();
+      const productMap = {};
+      for (const p of products) { productMap[p._id.toString()] = p; }
+
+      const items = stockAgg.map(row => {
+        const pid = row._id.toString();
+        const cost = avgCostMap[pid] || 0;
+        const value = row.totalQty * cost;
+        const product = productMap[pid];
+        return {
+          id: row._id,
+          name: product?.itemName || `Product ${product?.productCode || pid}`,
+          quantity: row.totalQty,
+          avgCost: Math.round(cost * 100) / 100,
+          amount: Math.round(value * 100) / 100,
+          drillable: false
+        };
+      }).sort((a, b) => b.amount - a.amount);
+
+      return {
+        drill: 'inventories',
+        label: 'Inventories - Product Breakdown',
+        items
+      };
+    }
+
+    case 'fixedAssets': {
+      // List of fixed assets with net book value
+      const assets = await FixedAsset.find({ status: 'Active', purchaseDate: { $lte: reportDate } }).lean();
+      return {
+        drill: 'fixedAssets',
+        label: 'Fixed Assets - Asset Breakdown',
+        items: assets.map(a => ({
+          id: a._id,
+          name: a.assetName,
+          category: a.assetCategory,
+          grossValue: a.purchaseValue || 0,
+          depreciation: a.accumulatedDepreciation || 0,
+          amount: (a.purchaseValue || 0) - (a.accumulatedDepreciation || 0),
+          drillable: false
+        })).sort((a, b) => b.amount - a.amount)
+      };
+    }
+
+    case 'loans': {
+      // List of active loans with outstanding
+      const loanDocs = await Loan.find({ status: { $in: ['Active', 'Overdue'] }, disbursementDate: { $lte: reportDate } }).lean();
+      return {
+        drill: 'loans',
+        label: 'Loans - Breakdown',
+        items: loanDocs.map(l => ({
+          id: l._id,
+          name: `${l.lenderName} - ${l.loanType}`,
+          loanType: l.loanType,
+          principal: l.outstandingPrincipal || 0,
+          interest: l.outstandingInterest || 0,
+          amount: l.totalOutstanding || 0,
+          drillable: false
+        })).sort((a, b) => b.amount - a.amount)
+      };
+    }
+
+    case 'capital': {
+      // List of capital accounts
+      const capitalDocs = await models.Capital.find({}).lean();
+      const capitalAccounts = await models.AccountMaster.find({ accountGroup: 'Capital', isActive: true }).lean();
+      const items = [
+        ...capitalDocs.map(c => ({
+          id: c._id,
+          name: c.ownerName,
+          type: c.capitalType,
+          amount: c.currentBalance || 0,
+          drillable: false
+        })),
+        ...capitalAccounts.map(a => ({
+          id: a._id,
+          name: a.accountName || a.name,
+          type: 'Account Master',
+          amount: a.openingBalanceType === 'Cr' ? (a.openingBalance || 0) : -(a.openingBalance || 0),
+          drillable: false
+        }))
+      ];
+      return {
+        drill: 'capital',
+        label: 'Capital Account - Breakdown',
+        items
+      };
+    }
+
+    case 'gstPayable': {
+      // GST payable breakdown by invoice
+      const gstAgg = await models.DealerInvoice.aggregate([
+        { $match: { invoiceDate: { $lte: reportDate }, status: { $nin: ['Cancelled', 'Draft'] }, isDraft: false, isDeleted: { $ne: true }, totalGst: { $gt: 0 } } },
+        { $sort: { invoiceDate: -1 } },
+        { $limit: 50 },
+        { $project: { invoiceNumber: 1, invoiceDate: 1, totalGst: 1, dealer: 1 } }
+      ]);
+      return {
+        drill: 'gstPayable',
+        label: 'GST Payable - Recent Invoices',
+        items: gstAgg.map(inv => ({
+          id: inv._id,
+          name: inv.invoiceNumber || 'Draft Invoice',
+          date: inv.invoiceDate,
+          amount: inv.totalGst || 0,
+          drillable: false
+        }))
+      };
+    }
+
+    default:
+      return { drill, label: 'Unknown drill category', items: [] };
+  }
+}
+
+async function getDrillIdDetail(drill, drillId, reportDate, models) {
+  const { SupplierLedger, DealerLedger } = models;
+
+  switch (drill) {
+    case 'tradePayables': {
+      // All SupplierLedger entries for a specific supplier
+      const entries = await SupplierLedger.find({
+        supplier: drillId,
+        entryDate: { $lte: reportDate }
+      }).sort({ entryDate: -1 }).lean();
+      return {
+        drill: 'tradePayables',
+        entityId: drillId,
+        label: entries[0]?.supplierName || 'Supplier Ledger',
+        transactions: entries.map(e => ({
+          id: e._id,
+          date: e.entryDate,
+          transactionType: e.transactionType,
+          description: e.description || e.narration || '',
+          debit: e.debitAmount || 0,
+          credit: e.creditAmount || 0,
+          runningBalance: e.runningBalance || 0,
+          referenceNumber: e.referenceNumber || e.invoiceNumber || ''
+        }))
+      };
+    }
+
+    case 'tradeReceivables': {
+      // All DealerLedger entries for a specific dealer
+      const entries = await DealerLedger.find({
+        dealer: drillId,
+        entryDate: { $lte: reportDate }
+      }).sort({ entryDate: -1 }).lean();
+      return {
+        drill: 'tradeReceivables',
+        entityId: drillId,
+        label: entries[0]?.dealerName || 'Dealer Ledger',
+        transactions: entries.map(e => ({
+          id: e._id,
+          date: e.entryDate,
+          transactionType: e.transactionType,
+          description: e.description || e.narration || '',
+          debit: e.debitAmount || 0,
+          credit: e.creditAmount || 0,
+          runningBalance: e.runningBalance || 0,
+          referenceNumber: e.referenceNumber || e.invoiceNumber || ''
+        }))
+      };
+    }
+
+    default:
+      return { drill, entityId: drillId, label: 'No detail available', transactions: [] };
+  }
+}

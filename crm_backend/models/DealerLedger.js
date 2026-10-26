@@ -1,0 +1,287 @@
+import mongoose from "mongoose";
+
+const dealerLedgerSchema = new mongoose.Schema({
+  // Reference to dealer
+  dealer: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Dealer",
+    required: true
+  },
+  dealerName: String,
+  dealerCode: String,
+  
+  // Ledger Entry Details
+  entryDate: {
+    type: Date,
+    required: true,
+    default: Date.now
+  },
+  
+  // Transaction Type
+  transactionType: {
+    type: String,
+    enum: ["Invoice", "Payment", "Credit Note", "Adjustment", "Opening Balance", "Advance Payment", "Advance Adjustment", "Order Confirmed", "Order Confirmed - Reversed"],
+    required: true
+  },
+  
+  // Invoice Information (if applicable)
+  invoice: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "DealerInvoice"
+  },
+  invoiceNumber: String,
+  invoiceValue: {
+    type: Number,
+    default: 0
+  },
+  
+  // Sales Type (CD Sales vs Regular Sales)
+  salesType: {
+    type: String,
+    enum: ['Regular Sale', 'CD Sales', null],
+    default: null
+  },
+  creditDaysApplied: {
+    type: Number,
+    default: 0
+  },
+  
+  // Credit Note Information (if applicable)
+  creditNote: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "CreditNote"
+  },
+  creditNoteNumber: String,
+  creditAmount: {
+    type: Number,
+    default: 0
+  },
+  
+  // Payment Information
+  dealerPayment: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "DealerPayment"
+  },
+  paymentReceived: {
+    type: Number,
+    default: 0
+  },
+  paymentMethod: {
+    type: String,
+    enum: ["Cash", "Cheque", "UPI", "Bank Transfer", "Credit Note", "Adjustment"]
+  },
+  
+  // Cheque Details (if payment method is Cheque)
+  chequeDetails: {
+    chequeNo: String,
+    bankName: String,
+    chequeDate: Date,
+    clearDate: Date,
+    status: {
+      type: String,
+      enum: ["Pending", "Cleared", "Bounced"],
+      default: "Pending"
+    }
+  },
+  
+  // UPI Details (if payment method is UPI)
+  upiDetails: {
+    upiId: String,
+    transactionId: String,
+    referenceNo: String
+  },
+  
+  // Bank Transfer Details (if payment method is Bank Transfer)
+  bankTransferDetails: {
+    bankName: String,
+    accountNumber: String,
+    transactionId: String,
+    referenceNo: String
+  },
+  
+  // Financial Calculations
+  debitAmount: {
+    type: Number,
+    default: 0
+  },
+  creditAmount: {
+    type: Number,
+    default: 0
+  },
+  runningBalance: {
+    type: Number,
+    required: true
+  },
+  
+  // Voucher source fields. These make voucher-origin ledger entries traceable and
+  // allow combined reports to avoid counting the same financial event twice.
+  referenceType: String,
+  referenceId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Voucher'
+  },
+  referenceNumber: String,
+
+  // Stable canonical-posting identity. This is intentionally separate from
+  // referenceId so legacy rows can coexist without an unsafe migration.
+  postingKey: {
+    type: String,
+    trim: true
+  },
+
+  // Additional Information
+  description: String,
+  remarks: String,
+  
+  // Credit Terms
+  creditDays: {
+    type: Number,
+    default: 0
+  },
+  dueDate: Date,
+  
+  // Points and Schemes
+  pointsEarned: {
+    type: Number,
+    default: 0
+  },
+  pointsRedeemed: {
+    type: Number,
+    default: 0
+  },
+  schemeAmount: {
+    type: Number,
+    default: 0
+  },
+  
+  // Status
+  status: {
+    type: String,
+    enum: ["Active", "Settled", "Overdue", "Cancelled"],
+    default: "Active"
+  },
+  
+  // Advance Payment Details
+  advanceDetails: {
+    isAdvance: Boolean,
+    advancePaymentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "DealerPayment"
+    },
+    adjustedInvoiceId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "DealerInvoice"
+    }
+  },
+  
+  // Aging Information
+  agingDays: {
+    type: Number,
+    default: 0
+  },
+  
+  // System Fields
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true
+  },
+  updatedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  }
+}, {
+  timestamps: true
+});
+
+// Pre-save middleware to calculate running balance
+dealerLedgerSchema.pre("save", async function(next) {
+  if (this.isNew) {
+    // Get the last entry for this dealer sorted by entryDate (not createdAt)
+    // to ensure correct running balance even for backdated entries
+    let lastEntryQuery = this.constructor.findOne(
+      { dealer: this.dealer, entryDate: { $lte: this.entryDate } },
+      {},
+      { sort: { entryDate: -1, createdAt: -1 } }
+    );
+    const session = this.$session();
+    if (session) lastEntryQuery = lastEntryQuery.session(session);
+    const lastEntry = await lastEntryQuery;
+    
+    let previousBalance = 0;
+    if (lastEntry && lastEntry._id.toString() !== this._id?.toString()) {
+      previousBalance = lastEntry.runningBalance;
+    }
+    
+    // Calculate new running balance
+    this.runningBalance = previousBalance + this.debitAmount - this.creditAmount;
+    
+    // Set aging days
+    if (this.dueDate) {
+      const today = new Date();
+      const dueDate = new Date(this.dueDate);
+      this.agingDays = Math.max(0, Math.floor((today - dueDate) / (1000 * 60 * 60 * 24)));
+    }
+  }
+  next();
+});
+
+// Indexes for better performance
+dealerLedgerSchema.index({ dealer: 1, entryDate: -1 });
+dealerLedgerSchema.index({ dealer: 1, status: 1 });
+dealerLedgerSchema.index({ invoice: 1 });
+dealerLedgerSchema.index({ creditNote: 1 });
+dealerLedgerSchema.index({ entryDate: -1 });
+dealerLedgerSchema.index({ runningBalance: 1 });
+dealerLedgerSchema.index(
+  { dealerPayment: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { dealerPayment: { $type: "objectId" } }
+  }
+);
+
+// Virtual for outstanding amount
+dealerLedgerSchema.virtual('outstandingAmount').get(function() {
+  return Math.max(0, this.runningBalance);
+});
+
+// Virtual for payment status
+dealerLedgerSchema.virtual('paymentStatus').get(function() {
+  if (this.runningBalance <= 0) return 'Settled';
+  if (this.agingDays > 0) return 'Overdue';
+  return 'Pending';
+});
+
+dealerLedgerSchema.index(
+  { postingKey: 1 },
+  { unique: true, partialFilterExpression: { postingKey: { $type: "string" } } }
+);
+
+// Export schema for multi-database support
+export { dealerLedgerSchema };
+
+export default mongoose.model("DealerLedger", dealerLedgerSchema);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

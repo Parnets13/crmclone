@@ -1,0 +1,50 @@
+import { getCompanyConnection, isValidCompany } from '../../config/multiDatabase.js';
+import { salesOrderSchema } from '../../models/SalesOrder.js';
+import { userSchema } from '../../models/User.js';
+import { dealerSchema } from '../../models/Dealer.js';
+import { productSchema } from '../../models/Product.js';
+import { regionSchema } from '../../models/Region.js';
+import { notificationSchema } from '../../models/Notification.js';
+import { deliveryAssignmentSchema } from '../models/DeliveryAssignment.js';
+import { deliveryPaymentSchema } from '../models/DeliveryPayment.js';
+import { deliveryRouteSchema } from '../models/DeliveryRoute.js';
+
+/** Resolve company from the authenticated token context. Request data cannot override it. */
+export function resolveCompanyKey(req) {
+  const company = req.company || req.user?.company;
+  if (!company) {
+    const err = new Error('Authenticated company context is required');
+    err.statusCode = 401;
+    throw err;
+  }
+
+  if (!isValidCompany(company)) {
+    const err = new Error(
+      `Invalid company: ${company}. Valid: jain-impex, ridhi, shree-jain-impex`,
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+  return company;
+}
+
+/** Company-scoped models for Delivery Executive APIs */
+export function getDeModels(req) {
+  const company = resolveCompanyKey(req);
+  const db = getCompanyConnection(company);
+  const model = (name, schema) => db.models[name] || db.model(name, schema);
+
+  return {
+    company,
+    db,
+    DeliveryAssignment: model('DeliveryAssignment', deliveryAssignmentSchema),
+    DeliveryPayment: model('DeliveryPayment', deliveryPaymentSchema),
+    DeliveryRoute: model('DeliveryRoute', deliveryRouteSchema),
+    SalesOrder: model('SalesOrder', salesOrderSchema),
+    User: model('User', userSchema),
+    Dealer: model('Dealer', dealerSchema),
+    Product: model('Product', productSchema),
+    Region: model('Region', regionSchema),
+    Notification: model('Notification', notificationSchema),
+  };
+}

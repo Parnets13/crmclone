@@ -1,0 +1,578 @@
+import mongoose from "mongoose";
+import { appliedSchemeSchema } from "./appliedScheme.js";
+import { addCreditDays } from "../utils/creditTerms.js";
+
+const productSchema = new mongoose.Schema({
+  product: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Product",
+    required: true
+  },
+  productCode: String,
+  productName: String,
+  HSNCode: String,
+  internalRate: String, // internal reference rate (never printed on invoice)
+  // Snapshot the Product Master sales classification used for this order line.
+  // Optional so legacy orders without the field continue to load normally.
+  salesType: {
+    type: String,
+    enum: ['Regular Sale', 'CD Sales']
+  },
+  quantity: {
+    type: Number,
+    required: true,
+    min: 1
+  },
+  unitPrice: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  gst: {
+    type: Number,
+    default: 0
+  },
+  gstAmount: {
+    type: Number,
+    default: 0
+  },
+  totalPrice: {
+    type: Number,
+    required: true
+  },
+  warehouse: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Warehouse"
+  },
+  warehouseName: String,
+  // Discount fields
+  discountPercentage: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  discountAmount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  promisedEffectiveDiscountPercentage: {
+    type: Number,
+    default: null,
+    min: 0,
+    max: 100
+  },
+  requiredSequentialStageRatePercentage: {
+    type: Number,
+    default: null,
+    min: 0,
+    max: 100
+  },
+  effectiveDiscountPercentage: {
+    type: Number,
+    default: null,
+    min: 0,
+    max: 100
+  },
+  masterDiscountCapApplied: {
+    type: Boolean,
+    default: false
+  },
+  combinedLevelDiscountCapApplied: {
+    type: Boolean,
+    default: false
+  },
+  levelDiscountTotalPercentage: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  discountFamilyKey: {
+    type: String,
+    default: null,
+    trim: true
+  },
+  dealerExtraDiscount: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  discountPolicySnapshot: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  discountPermissionSnapshot: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  discountType: {
+    type: String,
+    enum: ['direct', 'level_based', 'both'],
+    default: null
+  },
+  selectedDiscountLevel: {
+    type: Number,
+    default: null
+  },
+  // SE order: level names chosen by the sales executive (e.g. ["Executive Discount"])
+  selectedDiscountLevels: {
+    type: [String],
+    default: [],
+  },
+  // SE order: manual percentages given by SE per level (e.g. { "Executive Discount": 3 })
+  manualDiscountLevels: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  // Applied discount information
+  appliedDiscount: {
+    discountId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "DiscountMapping"
+    },
+    discountName: String,
+    discountType: String,
+    targetType: String,
+    selectedLevel: Number,
+    directDiscountPercentage: Number,
+    levels: [{
+      levelName: String,
+      discountPercentage: Number
+    }],
+    maxDiscountPercentage: Number,
+    masterDiscountCap: {
+      type: Number,
+      default: null,
+      min: 0,
+      max: 100
+    },
+    combinedLevelDiscountCap: {
+      type: Number,
+      default: null,
+      min: 0,
+      max: 100
+    }
+  },
+  // Stock arrival tracking fields
+  stockStatus: {
+    type: String,
+    enum: ['waiting', 'partial', 'available', 'unknown'],
+    default: 'unknown'
+  },
+  availableQuantity: {
+    type: Number,
+    default: 0
+  },
+  stockArrivedAt: {
+    type: Date,
+    default: null
+  },
+  stockCheckedAt: {
+    type: Date,
+    default: null
+  },
+  isSchemeFreeItem: {
+    type: Boolean,
+    default: false
+  },
+  schemeCode: {
+    type: String,
+    default: '',
+    trim: true
+  }
+});
+
+const salesOrderSchema = new mongoose.Schema({
+  orderNumber: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  /**
+   * Correlates Sales Orders that were split from ONE user action, so scheme
+   * progress can be reported per dealer intent rather than per order row.
+   *
+   * Two ways a split happens:
+   *  1. auto-split by product.salesType  → up to 2 independent orders, no parent link
+   *  2. partial dispatch shortage        → source order + a new Pending remainder
+   *
+   * Both orders of a split share the same orderGroupId. A non-split order also
+   * gets one (equal to its own orderNumber) so queries never need a fallback.
+   */
+  orderGroupId: {
+    type: String,
+    default: null,
+    index: true
+  },
+  dealer: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Dealer",
+    required: true
+  },
+  dealerName: String,
+  dealerCode: String,
+  dealerType: String,
+  region: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Region"
+  },
+  pinCode: String,
+  // Delivery address fields (can be corrected/updated)
+  deliveryAddress: String,
+  deliveryCity: String,
+  deliveryArea: String,
+  deliveryPinCode: String,
+  deliveryLatitude: Number,
+  deliveryLongitude: Number,
+  products: [productSchema],
+  orderDate: {
+    type: Date,
+    required: true
+  },
+  deliveryDate: Date,
+  creditDays: {
+    type: Number,
+    default: 30
+  },
+  salesType: {
+    type: String,
+    enum: ['Regular Sale', 'CD Sales'],
+    required: true
+  },
+  creditDaysApplied: {
+    type: Number,
+    default: 0
+  },
+  dueDate: Date,
+  grossAmount: {
+    type: Number,
+    required: true
+  },
+  totalGst: {
+    type: Number,
+    default: 0
+  },
+  discountAmount: {
+    type: Number,
+    default: 0
+  },
+  totalAmount: {
+    type: Number,
+    required: true
+  },
+  // Credit check amount: MRP minus direct + dealer extra discounts only (excludes level).
+  // Used for conservative credit-limit calculations so level-discount volatility
+  // doesn't let a dealer silently exceed their limit.
+  creditAmount: {
+    type: Number,
+    default: null
+  },
+        status: {
+          type: String,
+          enum: ["Pending", "Confirmed", "Processing", "In Transit", "Delivered", "Cancelled", "Rejected", "Rescheduled", "Missing", "Expired"],
+          default: "Pending"
+        },
+  type: {
+    type: String,
+    enum: ["Retail Sales Order", "Wholesale Sales Order", "Enterprise Sales Order", "Reseller Sales Order", "Independent Sales Order"],
+    required: true
+  },
+  remarks: String,
+  paymentDate: Date,
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  },
+  approvedAt: Date,
+  // Timestamp of the discount event used for finalized-history recency. This is
+  // set only on finalization or deliberate repricing while finalized.
+  discountFinalizedAt: {
+    type: Date,
+    default: null
+  },
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true
+  },
+  // Out-of-stock order fields
+  isOutOfStock: {
+    type: Boolean,
+    default: false
+  },
+  stockAvailable: {
+    type: Boolean,
+    default: false
+  },
+  stockAvailableNotifiedAt: {
+    type: Date,
+    default: null
+  },
+  stockValidation: [{
+    productId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product"
+    },
+    productName: String,
+    availableStock: {
+      type: Number,
+      default: 0
+    },
+    requestedQuantity: {
+      type: Number,
+      required: true
+    },
+    hasStock: {
+      type: Boolean,
+      default: true
+    },
+    shortfall: {
+      type: Number,
+      default: 0
+    },
+    warehouseId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Warehouse"
+    },
+    warehouseName: String
+  }],
+  // Expiry/Deadline fields for pending orders
+  expiryDate: {
+    type: Date,
+    default: null
+  },
+  expiryReason: {
+    type: String,
+    default: null
+  },
+  isExpired: {
+    type: Boolean,
+    default: false
+  },
+  expiredAt: {
+    type: Date,
+    default: null
+  },
+  expiryExtendedCount: {
+    type: Number,
+    default: 0
+  },
+  expiryHistory: [{
+    action: {
+      type: String,
+      enum: ['set', 'extended', 'expired', 'cancelled'],
+      required: true
+    },
+    previousDate: Date,
+    newDate: Date,
+    reason: String,
+    performedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+    performedAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  // Credit Overlimit tracking
+  creditOverlimit: {
+    isOverlimit: {
+      type: Boolean,
+      default: false
+    },
+    creditLimit: Number,
+    currentOutstanding: Number,
+    orderAmount: Number,
+    newOutstanding: Number,
+    overlimitAmount: Number,
+    requiresApproval: {
+      type: Boolean,
+      default: false
+    },
+    approvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+    approvedAt: Date,
+    approvalNotes: String,
+    rejectedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    rejectedAt: Date,
+    rejectionReason: String,
+    history: [{
+      action: {
+        type: String,
+        enum: ['requested', 'approved', 'rejected', 'invalidated', 'recalculated'],
+        required: true
+      },
+      creditLimit: Number,
+      currentOutstanding: Number,
+      orderAmount: Number,
+      newOutstanding: Number,
+      overlimitAmount: Number,
+      performedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+      },
+      performedAt: {
+        type: Date,
+        default: Date.now
+      },
+      notes: String
+    }]
+  },
+  // Partial dispatch deviations
+  deviations: [{
+    sourceSalesOrderLineId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null
+    },
+    productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product" },
+    productName: String,
+    originalQty: Number,
+    dispatchedQty: Number,
+    reducedQty: Number,
+    reason: String,
+    createdAt: { type: Date, default: Date.now },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    newOrderCreated: { type: Boolean, default: false },
+    newOrderNumber: String
+  }],
+
+  // Order-level stock status summary
+  orderStockStatus: {
+    totalProducts: {
+      type: Number,
+      default: 0
+    },
+    availableProducts: {
+      type: Number,
+      default: 0
+    },
+    partialProducts: {
+      type: Number,
+      default: 0
+    },
+    waitingProducts: {
+      type: Number,
+      default: 0
+    },
+    overallStatus: {
+      type: String,
+      enum: ['ready', 'partial', 'waiting', 'unknown'],
+      default: 'unknown'
+    },
+    lastChecked: {
+      type: Date,
+      default: null
+    }
+  },
+  /**
+   * The schemes the salesman chose to GIVE on this order.
+   *
+   * `default: undefined` is deliberate and load-bearing: it keeps the field
+   * ABSENT on orders that never went through the picker (older documents, and
+   * any API caller that does not send it), which the engine reads as "no gate —
+   * count every matching scheme", i.e. exactly the behaviour before this field
+   * existed. An ARRAY — including an empty one — switches the gate ON and
+   * restricts this order to precisely those schemes, so an unticked scheme is
+   * neither counted toward progress nor rewarded at invoice time.
+   *
+   * `schemeCode`/`schemeName` are snapshotted so the order still reads correctly
+   * if the scheme is later renamed or deleted.
+   */
+  appliedSchemes: {
+    type: [appliedSchemeSchema],
+    default: undefined
+  }
+}, {
+  timestamps: true
+});
+
+// Pre-save middleware to calculate product amounts first, then order totals
+salesOrderSchema.pre("save", function(next) {
+  // STEP 1: Calculate product-level amounts — unitPrice IS MRP (GST inclusive after migration)
+  this.products.forEach(product => {
+    // unitPrice is already MRP (GST inclusive) — don't add GST again
+    const baseAmount = product.quantity * product.unitPrice;
+    
+    // Apply discount on MRP-based amount
+    const discAmt = product.discountAmount || 0;
+    const finalAmount = baseAmount - discAmt;
+    
+    // Final amount already includes GST
+    product.totalPrice = parseFloat(finalAmount.toFixed(2));
+    
+    // Reverse-calculate GST for tax display
+    const gstRate = product.gst || 0;
+    product.gstAmount = gstRate > 0 
+      ? parseFloat((finalAmount - finalAmount / (1 + gstRate / 100)).toFixed(2))
+      : 0;
+  });
+
+  // STEP 2: Calculate due date.
+  //
+  // `creditDays: 0` means "pay on demand" and is the schema default, so a
+  // truthiness check (`if (this.creditDays)`) would SKIP this for the most
+  // common case and leave `dueDate` unset — making the order look as if it
+  // never falls due in the overdue report. Checked against null/undefined.
+  if (this.orderDate && this.creditDays !== null && this.creditDays !== undefined) {
+    const dueDate = addCreditDays(this.orderDate, this.creditDays);
+    if (dueDate) this.dueDate = dueDate;
+  }
+
+  // STEP 3: Calculate order-level amounts
+  this.grossAmount = this.products.reduce((sum, product) => {
+    return sum + (product.quantity * product.unitPrice);
+  }, 0);
+
+  this.totalGst = this.products.reduce((sum, product) => {
+    return sum + product.gstAmount;
+  }, 0);
+
+  // Order-level discountAmount = sum of all product discounts
+  this.discountAmount = this.products.reduce((sum, product) => {
+    return sum + (product.discountAmount || 0);
+  }, 0);
+
+  this.totalAmount = this.products.reduce((sum, product) => {
+    return sum + product.totalPrice;
+  }, 0);
+
+  next();
+});
+
+// Generate order number
+salesOrderSchema.pre("save", async function(next) {
+  if (!this.orderNumber) {
+    const year = new Date().getFullYear();
+    const count = await mongoose.model("SalesOrder").countDocuments();
+    this.orderNumber = `SO-${year}-${String(count + 1).padStart(4, "0")}`;
+  }
+  // A standalone order is its own group, so downstream grouping never needs a
+  // null check. Callers that create split siblings set this explicitly first.
+  if (!this.orderGroupId) {
+    this.orderGroupId = this.orderNumber;
+  }
+  next();
+});
+
+// Indexes for dashboard listing, filtering and stock-status queries
+salesOrderSchema.index({ createdAt: -1 });
+salesOrderSchema.index({ dealer: 1, createdAt: -1 });
+salesOrderSchema.index({ dealer: 1, status: 1, orderDate: -1 });
+salesOrderSchema.index({ status: 1, createdAt: -1 });
+salesOrderSchema.index({ isOutOfStock: 1, status: 1 });
+salesOrderSchema.index({ "orderStockStatus.overallStatus": 1, status: 1 });
+// Speeds up the stock-arrival lookup ($elemMatch on product + warehouse + stockStatus)
+salesOrderSchema.index({ status: 1, "products.product": 1, "products.warehouse": 1 });
+
+// Export schema for multi-database support
+export { salesOrderSchema };
+
+export default mongoose.model("SalesOrder", salesOrderSchema);

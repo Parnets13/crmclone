@@ -1,0 +1,585 @@
+import mongoose from 'mongoose';
+
+const discountLevelSchema = new mongoose.Schema({
+  levelName: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  discountPercentage: {
+    type: Number,
+    required: true,
+    min: 0,
+    max: 100,
+    validate: {
+      validator: function(value) {
+        // This validation will be handled at the parent document level
+        return value >= 0 && value <= 100;
+      },
+      message: 'Discount percentage must be between 0 and 100'
+    }
+  },
+  description: {
+    type: String,
+    trim: true
+  }
+});
+
+const discountMappingSchema = new mongoose.Schema({
+  // Discount Configuration
+  discountName: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  discountType: {
+    type: String,
+    enum: ['direct', 'level_based', 'both'],
+    required: true,
+    default: 'direct'
+  },
+  mappingType: {
+    type: String,
+    enum: ['sales', 'purchase'],
+    required: true
+  },
+  
+  // Hierarchy Configuration (Optional - for flexible targeting)
+  targetType: {
+    type: String,
+    enum: ['product', 'brand', 'subcategory', 'category', 'extendedSubcategory1', 'extendedSubcategory2'],
+    required: true
+  },
+  
+  // Target References (Only one will be used based on targetType)
+  product: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Product',
+    required: function() { return this.targetType === 'product'; }
+  },
+  brand: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Brand',
+    required: function() { return this.targetType === 'brand'; }
+  },
+  subcategory: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Subcategory',
+    required: function() { return this.targetType === 'subcategory'; }
+  },
+  category: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Category',
+    required: function() { return this.targetType === 'category'; }
+  },
+  
+  // Extended Subcategory References
+  extendedSubcategory1: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ExtendedSubcategory',
+    required: function() { return this.targetType === 'extendedSubcategory1'; }
+  },
+  extendedSubcategory2: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ExtendedSubcategory',
+    required: function() { return this.targetType === 'extendedSubcategory2'; }
+  },
+  
+  // Extended Subcategory Support (for subcategory-based discounts)
+  includeExtendedSubcategories: {
+    type: Boolean,
+    default: true
+  },
+  
+  // Discount Values
+  directDiscountPercentage: {
+    type: Number,
+    min: 0,
+    max: 100,
+    required: function() { return this.discountType === 'direct' || this.discountType === 'both'; }
+  },
+  
+  // Historical compatibility only. This field is no longer validated or enforced.
+  maxDiscountPercentage: Number,
+
+  // Aggregate cap for the arithmetic sum of selected level discounts only.
+  // Direct and dealer-extra discounts are intentionally excluded.
+  combinedLevelDiscountCap: {
+    type: Number,
+    min: 0,
+    max: 100,
+    validate: {
+      validator: (value) => value === null || value === undefined || Number.isFinite(value),
+      message: 'Combined selected-level discount cap must be a finite number between 0 and 100'
+    }
+  },
+
+  // Sole aggregate cap for the effective sequential discount
+  // (direct + selected levels + dealer extra) on sales mappings.
+  masterDiscountCap: {
+    type: Number,
+    required: function() { return this.mappingType === 'sales'; },
+    min: 0,
+    max: 100,
+    validate: {
+      validator: (value) => value === null || value === undefined || Number.isFinite(value),
+      message: 'Master discount cap must be a finite number between 0 and 100'
+    }
+  },
+  
+  levels: {
+    type: [discountLevelSchema],
+    required: function() { return this.discountType === 'level_based' || this.discountType === 'both'; },
+    validate: {
+      validator: function(levels) {
+        const needsLevels = this.discountType === 'level_based' || this.discountType === 'both';
+        return !needsLevels || (levels && levels.length > 0);
+      },
+      message: 'At least one level is required for level-based or both discount types'
+    }
+  },
+  
+  // Validity Period
+  validFrom: {
+    type: Date,
+    required: true,
+    default: Date.now
+  },
+  validTo: {
+    type: Date,
+    required: true
+  },
+  
+  // Status and Approval
+  status: {
+    type: String,
+    enum: ['Draft', 'Pending Approval', 'Approved', 'Rejected', 'Expired', 'Inactive'],
+    default: 'Pending Approval'
+  },
+  
+  // Approval Information
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  approvedAt: Date,
+  rejectionReason: String,
+  
+  // Additional Configuration
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  priority: {
+    type: Number,
+    default: 0,
+    comment: 'Higher number = higher priority for same target type'
+  },
+  
+  // Usage Limits (Optional)
+  maxUsageCount: {
+    type: Number,
+    min: 0
+  },
+  currentUsageCount: {
+    type: Number,
+    default: 0
+  },
+  
+  // Minimum Order Requirements (Optional)
+  minOrderAmount: {
+    type: Number,
+    min: 0,
+    default: 0
+  },
+  minOrderQuantity: {
+    type: Number,
+    min: 0,
+    default: 0
+  },
+  
+  // Dealer Restrictions (Optional)
+  applicableDealerTypes: [{
+    type: String,
+    enum: ['Retailer', 'Wholeseller', 'Distributor', 'Resellers', 'Independent', 'Independent Dealer']
+  }],
+  
+  // Metadata
+  remarks: String,
+  internalNotes: String,
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  }
+}, {
+  timestamps: true
+});
+
+// Indexes for better performance
+discountMappingSchema.index({ targetType: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ product: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ brand: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ subcategory: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ category: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ extendedSubcategory1: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ extendedSubcategory2: 1, status: 1, isActive: 1 });
+discountMappingSchema.index({ validFrom: 1, validTo: 1 });
+discountMappingSchema.index({ mappingType: 1, status: 1 });
+
+// Virtual for checking if discount is currently valid
+discountMappingSchema.virtual('isCurrentlyValid').get(function() {
+  const now = new Date();
+  return this.status === 'Approved' && 
+         this.isActive && 
+         this.validFrom <= now && 
+         this.validTo >= now &&
+         (this.maxUsageCount === undefined || this.currentUsageCount < this.maxUsageCount);
+});
+
+// Method to get applicable discount percentage for a specific level
+discountMappingSchema.methods.getDiscountForLevel = function(levelName) {
+  if (this.discountType === 'direct') {
+    return this.directDiscountPercentage;
+  }
+  
+  if (this.discountType === 'level_based') {
+    const level = this.levels.find(l => l.levelName === levelName);
+    return level ? level.discountPercentage : 0;
+  }
+  
+  if (this.discountType === 'both') {
+    // For 'both' type, return direct discount + level discount
+    const levelDiscount = this.levels.find(l => l.levelName === levelName);
+    const directDiscount = this.directDiscountPercentage || 0;
+    const additionalDiscount = levelDiscount ? levelDiscount.discountPercentage : 0;
+    return { directDiscount, additionalDiscount, total: directDiscount + additionalDiscount };
+  }
+  
+  return 0;
+};
+
+// Method to get all available levels for level-based discounts
+discountMappingSchema.methods.getAvailableLevels = function() {
+  if (this.discountType === 'level_based') {
+    return this.levels.map(level => ({
+      levelName: level.levelName,
+      discountPercentage: level.discountPercentage,
+      description: level.description
+    }));
+  }
+  return [];
+};
+
+// Pre-save middleware for validation
+discountMappingSchema.pre('save', function(next) {
+  // Ensure validTo is after validFrom
+  if (this.validTo <= this.validFrom) {
+    return next(new Error('Valid To date must be after Valid From date'));
+  }
+  
+  // Sales mappings use independent limits for selected levels and the full
+  // effective sequence. Historical maxDiscountPercentage is accepted only as
+  // a migration fallback for level-capable mappings.
+  if (this.mappingType === 'sales') {
+    const directDiscount = this.discountType === 'direct' || this.discountType === 'both'
+      ? Number(this.directDiscountPercentage || 0)
+      : 0;
+    if (directDiscount > this.masterDiscountCap) {
+      return next(new Error(
+        `Master discount cap (${this.masterDiscountCap}%) cannot be lower than the direct discount (${directDiscount}%)`
+      ));
+    }
+
+    const hasLevelDiscounts = this.discountType === 'level_based' || this.discountType === 'both';
+    const combinedLevelCap = this.combinedLevelDiscountCap
+      ?? this.maxDiscountPercentage;
+    if (hasLevelDiscounts
+        && (combinedLevelCap === null
+          || combinedLevelCap === undefined
+          || !Number.isFinite(Number(combinedLevelCap))
+          || Number(combinedLevelCap) < 0
+          || Number(combinedLevelCap) > 100)) {
+      return next(new Error(
+        'Combined selected-level discount cap is required for level-based sales mappings and must be between 0 and 100'
+      ));
+    }
+  }
+  
+  // Auto-expire if past validTo date
+  if (new Date() > this.validTo && this.status === 'Approved') {
+    this.status = 'Expired';
+    this.isActive = false;
+    console.log(`🕒 Auto-expired discount "${this.discountName}" - validTo: ${this.validTo}`);
+  }
+  
+  next();
+});
+
+// Static method to find applicable discounts for a product
+discountMappingSchema.statics.findApplicableDiscounts = async function(productId, mappingType = 'sales', dealerType = null, dbConnection = null) {
+  try {
+    // Get product with full hierarchy
+    // Use the connection from the model instance if dbConnection not provided
+    const connection = dbConnection || this.db;
+    
+    // Import and register all necessary schemas on the connection
+    const { productSchema } = await import('./Product.js');
+    const { brandSchema } = await import('./Brand.js');
+    const { categorySchema } = await import('./Category.js');
+    const { subcategorySchema } = await import('./Subcategory.js');
+    const { extendedSubcategorySchema } = await import('./ExtendedSubcategory.js');
+    
+    // Register models on the connection if not already registered
+    const Product = connection.models.Product || connection.model('Product', productSchema);
+    const Brand = connection.models.Brand || connection.model('Brand', brandSchema);
+    const Category = connection.models.Category || connection.model('Category', categorySchema);
+    const Subcategory = connection.models.Subcategory || connection.model('Subcategory', subcategorySchema);
+    const ExtendedSubcategory = connection.models.ExtendedSubcategory || connection.model('ExtendedSubcategory', extendedSubcategorySchema);
+    
+    const product = await Product.findById(productId)
+      .populate('category')
+      .populate('subcategory')
+      .populate('brand')
+      .populate('subcategory1')
+      .populate('subcategory2')
+      .populate('subcategory3')
+      .populate('subcategory4')
+      .populate('subcategory5');
+    
+    if (!product) {
+      return [];
+    }
+    
+    const now = new Date();
+    const baseQuery = {
+      mappingType,
+      status: 'Approved',
+      isActive: true,
+      validFrom: { $lte: now },
+      validTo: { $gte: now }
+    };
+    
+    // Add dealer type filter if specified
+    if (dealerType) {
+      baseQuery.$or = [
+        { applicableDealerTypes: { $size: 0 } }, // No restrictions
+        { applicableDealerTypes: dealerType }
+      ];
+    }
+    
+    // Priority order: Product > Extended Level 2 > Extended Level 1 > Brand > Subcategory > Category
+    const discountQueries = [
+      // 1. Product-specific discounts (Highest Priority)
+      { ...baseQuery, targetType: 'product', product: productId },
+      
+      // 2. Extended Level 2 discounts (if product has level 2)
+      ...(product.subcategory2 ? [{ ...baseQuery, targetType: 'extendedSubcategory2', extendedSubcategory2: product.subcategory2._id }] : []),
+      
+      // 3. Extended Level 1 discounts (if product has level 1)
+      ...(product.subcategory1 ? [{ ...baseQuery, targetType: 'extendedSubcategory1', extendedSubcategory1: product.subcategory1._id }] : []),
+      
+      // 4. Brand-based discounts
+      { ...baseQuery, targetType: 'brand', brand: product.brand._id },
+      
+      // 5. Subcategory-based discounts
+      { ...baseQuery, targetType: 'subcategory', subcategory: product.subcategory._id },
+      
+      // 6. Category-based discounts (Lowest Priority)
+      { ...baseQuery, targetType: 'category', category: product.category._id }
+    ];
+    
+    // Remove the old extended subcategory logic since we now handle them as separate target types
+    
+    // Execute queries in priority order and return first match
+    for (const query of discountQueries) {
+      const discounts = await this.find(query)
+        .populate('product brand category subcategory extendedSubcategory1 extendedSubcategory2', 'name itemName')
+        .sort({ priority: -1, createdAt: -1 })
+        .limit(5); // Limit to prevent too many results
+      
+      if (discounts.length > 0) {
+        // Filter out invalid discounts (level-based/both type without levels)
+        const validDiscounts = discounts.filter(discount => {
+          // For direct type, always valid
+          if (discount.discountType === 'direct') {
+            return true;
+          }
+          
+          // For level_based or both type, must have levels defined
+          if (discount.discountType === 'level_based' || discount.discountType === 'both') {
+            const hasValidLevels = discount.levels && discount.levels.length > 0;
+            
+            if (!hasValidLevels) {
+              console.warn(`⚠️ Skipping discount "${discount.discountName}" (${discount.discountType}) - no levels defined`);
+              return false;
+            }
+            
+            return true;
+          }
+          
+          return true;
+        });
+        
+        if (validDiscounts.length > 0) {
+          return validDiscounts.map(discount => ({
+            ...discount.toObject(),
+            targetInfo: {
+              targetType: discount.targetType,
+              targetName: this.getTargetName(discount, product)
+            }
+          }));
+        }
+      }
+    }
+    
+    return [];
+  } catch (error) {
+    console.error('Error finding applicable discounts:', error);
+    return [];
+  }
+};
+
+// Helper method to get target name for display
+discountMappingSchema.statics.getTargetName = function(discount, product) {
+  switch (discount.targetType) {
+    case 'product':
+      return product.itemName;
+    case 'brand':
+      return discount.brand?.name || product.brand?.name;
+    case 'subcategory':
+      return discount.subcategory?.name || product.subcategory?.name;
+    case 'category':
+      return discount.category?.name || product.category?.name;
+    case 'extendedSubcategory1':
+      return discount.extendedSubcategory1?.name || product.subcategory1?.name;
+    case 'extendedSubcategory2':
+      return discount.extendedSubcategory2?.name || product.subcategory2?.name;
+    default:
+      return 'Unknown';
+  }
+};
+
+// Static method to fix discounts with missing levels
+discountMappingSchema.statics.fixDiscountsWithMissingLevels = async function() {
+  try {
+    console.log('🔧 Fixing discounts with missing levels...');
+    
+    // Find discounts that need levels but don't have them
+    const discountsToFix = await this.find({
+      $or: [
+        { discountType: 'level_based' },
+        { discountType: 'both' }
+      ],
+      $or: [
+        { levels: { $exists: false } },
+        { levels: { $size: 0 } }
+      ]
+    });
+    
+    console.log(`Found ${discountsToFix.length} discounts to fix`);
+    
+    for (const discount of discountsToFix) {
+      // Add default levels
+      const defaultLevels = [
+        {
+          levelName: "Silver",
+          discountPercentage: 2,
+          description: "Silver level discount"
+        },
+        {
+          levelName: "Gold", 
+          discountPercentage: 4,
+          description: "Gold level discount"
+        },
+        {
+          levelName: "Platinum",
+          discountPercentage: 6,
+          description: "Platinum level discount"
+        }
+      ];
+      
+      // Filter out levels with 0 or negative percentages
+      const validLevels = defaultLevels.filter(level => level.discountPercentage > 0);
+      
+      if (validLevels.length > 0) {
+        await this.findByIdAndUpdate(discount._id, {
+          $set: { levels: validLevels }
+        });
+        
+        console.log(`✅ Fixed discount "${discount.discountName}" - added ${validLevels.length} levels`);
+      } else {
+        // If no valid levels can be added, convert to direct type
+        await this.findByIdAndUpdate(discount._id, {
+          $set: { discountType: 'direct' },
+          $unset: { levels: "" }
+        });
+        
+        console.log(`✅ Converted discount "${discount.discountName}" to direct type`);
+      }
+    }
+    
+    return discountsToFix.length;
+  } catch (error) {
+    console.error('Error fixing discounts:', error);
+    return 0;
+  }
+};
+
+// Static method to automatically expire discounts past their validTo date
+discountMappingSchema.statics.expireDiscounts = async function() {
+  try {
+    console.log('🕒 Checking for expired discounts...');
+    
+    const now = new Date();
+    
+    // Find approved discounts that are past their validTo date
+    const expiredDiscounts = await this.find({
+      status: 'Approved',
+      validTo: { $lt: now },
+      isActive: true
+    });
+    
+    console.log(`Found ${expiredDiscounts.length} discounts to expire`);
+    
+    if (expiredDiscounts.length > 0) {
+      // Update all expired discounts
+      const result = await this.updateMany(
+        {
+          status: 'Approved',
+          validTo: { $lt: now },
+          isActive: true
+        },
+        {
+          $set: {
+            status: 'Expired',
+            isActive: false
+          }
+        }
+      );
+      
+      console.log(`✅ Expired ${result.modifiedCount} discounts`);
+      
+      // Log each expired discount for audit trail
+      for (const discount of expiredDiscounts) {
+        console.log(`   - Expired: "${discount.discountName}" (Valid until: ${discount.validTo.toISOString().split('T')[0]})`);
+      }
+      
+      return result.modifiedCount;
+    }
+    
+    return 0;
+  } catch (error) {
+    console.error('Error expiring discounts:', error);
+    return 0;
+  }
+};
+
+// Ensure virtual fields are serialized
+discountMappingSchema.set('toJSON', { virtuals: true });
+discountMappingSchema.set('toObject', { virtuals: true });
+
+// Export schema for multi-database support
+export { discountMappingSchema };
+
+export default mongoose.model('DiscountMapping', discountMappingSchema);

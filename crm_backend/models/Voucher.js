@@ -1,0 +1,305 @@
+import mongoose from 'mongoose';
+
+const voucherSchema = new mongoose.Schema({
+  // Voucher identification
+  voucherNumber: {
+    type: String,
+    required: true,
+    unique: true,
+    index: true
+  },
+  voucherType: {
+    type: String,
+    enum: ['Receipt', 'Payment', 'Contra', 'Journal'],
+    required: true,
+    index: true
+  },
+  voucherDate: {
+    type: Date,
+    required: true,
+    index: true
+  },
+  financialYear: {
+    type: String,
+    required: true
+  },
+  
+  // Party details
+  partyType: {
+    type: String,
+    enum: ['Dealer', 'Supplier', 'Other', 'Internal', 'Family/Friends'],
+    required: true
+  },
+  partyId: {
+    type: mongoose.Schema.Types.ObjectId,
+    refPath: 'partyType'
+  },
+  partyName: String,
+  
+  // Transaction details
+  transactionMode: {
+    type: String,
+    enum: ['Cash', 'Bank', 'Cheque', 'UPI', 'NEFT', 'RTGS', 'Card', 'Internal'],
+    required: true
+  },
+  
+  // Bank details (for bank transactions)
+  bankAccount: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BankAccount'
+  },
+  bankAccountName: String,
+  
+  // Cheque details
+  chequeNumber: String,
+  chequeDate: Date,
+  chequeBank: String,
+  chequeStatus: {
+    type: String,
+    enum: ['Pending', 'Cleared', 'Bounced', 'Cancelled']
+  },
+  
+  // UPI/Online details
+  upiTransactionId: String,
+  referenceNumber: String,
+  
+  // Amount details
+  totalAmount: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  allocatedAmount: {
+    type: Number,
+    default: 0
+  },
+  unallocatedAmount: {
+    type: Number,
+    default: 0
+  },
+  
+  // Allocation type
+  allocationType: {
+    type: String,
+    enum: ['OnAccount', 'AgainstReference', 'Mixed'],
+    default: 'OnAccount'
+  },
+  
+  // Cash splitting for compliance
+  isCashSplit: {
+    type: Boolean,
+    default: false
+  },
+  parentVoucherId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Voucher'
+  },
+  splitSequence: Number,
+  totalSplits: Number,
+  originalAmount: Number,
+  splitReason: {
+    type: String,
+    default: 'Cash limit compliance (₹10,000/day)'
+  },
+  splitDirection: {
+    type: String,
+    enum: ['forward', 'backward'],
+    default: 'backward'
+  },
+  splitFrequency: {
+    type: Number,
+    enum: [1, 2, 3],
+    default: 1
+  },
+  hasConflicts: {
+    type: Boolean,
+    default: false
+  },
+  conflictResolution: String,
+  
+  // Invoice and opening-balance allocation snapshots
+  allocations: [{
+    paymentAllocationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'PaymentAllocation'
+    },
+    allocationRowId: mongoose.Schema.Types.ObjectId,
+    targetType: {
+      type: String,
+      enum: ['Invoice', 'OpeningBalance'],
+      default: 'Invoice'
+    },
+    targetLabel: String,
+    invoiceId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref() {
+        return this.ownerDocument()?.partyType === 'Supplier'
+          ? 'SupplierInvoice'
+          : 'DealerInvoice';
+      },
+      required() {
+        return this.targetType === 'Invoice';
+      },
+      validate: {
+        validator(value) {
+          return this.targetType === 'Invoice' ? value != null : value == null;
+        },
+        message: 'Invoice targets require invoiceId and OpeningBalance targets must omit it'
+      }
+    },
+    invoiceNumber: String,
+    originalAmount: Number,
+    originalDate: Date,
+    previouslyAllocated: Number,
+    allocatedAmount: Number,
+    remainingAmount: Number,
+    paymentStatus: {
+      type: String,
+      enum: ['Partial', 'Full']
+    },
+    // Legacy invoice snapshot names retained for existing consumers.
+    invoiceAmount: Number,
+    invoiceDate: Date,
+    previouslyPaid: Number,
+    allocationDate: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  
+  // Contra voucher details (for internal transfers)
+  contraDetails: {
+    fromAccount: {
+      accountType: {
+        type: String,
+        enum: ['Cash', 'Bank']
+      },
+      accountId: mongoose.Schema.Types.ObjectId,
+      accountName: String
+    },
+    toAccount: {
+      accountType: {
+        type: String,
+        enum: ['Cash', 'Bank']
+      },
+      accountId: mongoose.Schema.Types.ObjectId,
+      accountName: String
+    }
+  },
+  
+  // Additional details
+  narration: String,
+  notes: String,
+  internalNotes: String,
+  attachments: [{
+    fileName: String,
+    fileUrl: String,
+    uploadedAt: Date
+  }],
+  
+  // Canonical source identity. postingKey is unique per financial tender and
+  // makes retries safe even when the client times out after commit.
+  sourceType: {
+    type: String,
+    trim: true
+  },
+  sourceId: {
+    type: String,
+    trim: true
+  },
+  sourceSequence: {
+    type: Number,
+    min: 1
+  },
+  postingKey: {
+    type: String,
+    trim: true
+  },
+  postingFingerprint: {
+    type: String,
+    minlength: 64,
+    maxlength: 64
+  },
+  journalVoucher: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalVoucher'
+  },
+  cheque: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Cheque'
+  },
+
+  // Status and workflow
+  status: {
+    type: String,
+    enum: ['Draft', 'Posted', 'Cancelled', 'Reversed'],
+    default: 'Posted',
+    index: true
+  },
+  
+  // Cancellation details
+  cancelledAt: Date,
+  cancelledBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  cancelReason: String,
+  
+  // Reversal details
+  reversedAt: Date,
+  reversedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  reversalVoucherId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Voucher'
+  },
+  
+  // Audit trail
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }
+}, {
+  timestamps: true
+});
+
+// Indexes for performance
+voucherSchema.index({ voucherDate: 1, voucherType: 1 });
+voucherSchema.index({ partyId: 1, voucherDate: -1 });
+voucherSchema.index({ status: 1, voucherDate: -1 });
+voucherSchema.index({ 'allocations.invoiceId': 1 });
+voucherSchema.index(
+  { postingKey: 1 },
+  { unique: true, partialFilterExpression: { postingKey: { $type: 'string' } } }
+);
+voucherSchema.index({ sourceType: 1, sourceId: 1, sourceSequence: 1 });
+
+// Calculate unallocated amount before save
+voucherSchema.pre('save', function(next) {
+  if (this.isModified('allocatedAmount') || this.isModified('totalAmount')) {
+    this.unallocatedAmount = this.totalAmount - this.allocatedAmount;
+  }
+  next();
+});
+
+const Voucher = mongoose.model('Voucher', voucherSchema);
+
+// Export schema for multi-database support
+export { voucherSchema };
+
+export default Voucher;

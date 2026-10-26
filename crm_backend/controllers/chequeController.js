@@ -1,0 +1,869 @@
+import { chequeSchema } from "../models/Cheque.js";
+import { dealerSchema } from "../models/Dealer.js";
+import { voucherSchema } from "../models/Voucher.js";
+import { bankAccountSchema } from "../models/BankAccount.js";
+import { journalVoucherSchema } from "../models/JournalVoucher.js";
+import { accountMasterSchema } from "../models/AccountMaster.js";
+import { dealerLedgerSchema } from "../models/DealerLedger.js";
+import { paymentAllocationSchema } from "../models/PaymentAllocation.js";
+import { postDealerReceipt, reverseDealerReceipt, createReceiptError } from "../services/dealerReceiptService.js";
+import { reversePaymentAllocationById } from "./paymentAllocationController.js";
+import { getFinancialYear } from "../services/voucherNumberService.js";
+import { assertPeriodOpen, handlePeriodLockError } from "../services/periodLockService.js";
+
+const getModels = (dbConnection) => {
+  return {
+    Cheque: dbConnection.models.Cheque || dbConnection.model('Cheque', chequeSchema),
+    Dealer: dbConnection.models.Dealer || dbConnection.model('Dealer', dealerSchema),
+    Voucher: dbConnection.models.Voucher || dbConnection.model('Voucher', voucherSchema),
+    BankAccount: dbConnection.models.BankAccount || dbConnection.model('BankAccount', bankAccountSchema),
+    JournalVoucher: dbConnection.models.JournalVoucher || dbConnection.model('JournalVoucher', journalVoucherSchema),
+    AccountMaster: dbConnection.models.AccountMaster || dbConnection.model('AccountMaster', accountMasterSchema),
+    DealerLedger: dbConnection.models.DealerLedger || dbConnection.model('DealerLedger', dealerLedgerSchema),
+    PaymentAllocation: dbConnection.models.PaymentAllocation || dbConnection.model('PaymentAllocation', paymentAllocationSchema)
+  };
+};
+
+// Helper function to safely parse numbers
+const safeParseInt = (value, defaultValue = 1) => {
+  const num = parseInt(value);
+  return isNaN(num) || num < 1 ? defaultValue : num;
+};
+
+// Get all cheques with pagination and search
+export const getCheques = async (req, res) => {
+  try {
+    const { Cheque, Dealer } = getModels(req.dbConnection);
+    const {
+      page = 1,
+      limit = 10,
+      search = "",
+      status,
+      dealer,
+      sortBy = "date",
+      sortOrder = "desc",
+      startDate,
+      endDate,
+    } = req.query;
+
+    // Parse pagination parameters
+    const pageNumber = safeParseInt(page, 1);
+    const limitNumber = safeParseInt(limit, 10);
+    const skip = (pageNumber - 1) * limitNumber;
+
+    // Build filter object
+    const filter = { isDeleted: false };
+
+    if (search) {
+      // First, find dealers that match the search term
+      const matchingDealers = await Dealer.find({
+        $or: [
+          { name: { $regex: search, $options: "i" } },
+          { code: { $regex: search, $options: "i" } }
+        ]
+      }).select('_id');
+      
+      const dealerIds = matchingDealers.map(d => d._id);
+      
+      // Build search query including dealer matches
+      filter.$or = [
+        { chequeNo: { $regex: search, $options: "i" } },
+        { bankName: { $regex: search, $options: "i" } },
+        { remarks: { $regex: search, $options: "i" } },
+        ...(dealerIds.length > 0 ? [{ dealerId: { $in: dealerIds } }] : [])
+      ];
+    }
+
+    if (status && status !== "All") {
+      filter.status = status;
+    }
+
+    if (dealer && dealer !== "All") {
+      // Find dealer by code and get their ID
+      const dealerDoc = await Dealer.findOne({ code: dealer });
+      if (dealerDoc) {
+        filter.dealerId = dealerDoc._id;
+      }
+    }
+
+    if (startDate && endDate) {
+      filter.date = {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate),
+      };
+    }
+
+    // Sort configuration
+    const sort = {};
+    sort[sortBy] = sortOrder === "desc" ? -1 : 1;
+
+    // Get total count for pagination
+    const total = await Cheque.countDocuments(filter);
+
+    // Get cheques with pagination and populate dealer info
+    const cheques = await Cheque.find(filter)
+      .populate("dealerId", "name code phone address")
+      .sort(sort)
+      .limit(limitNumber)
+      .skip(skip)
+      .select("-__v");
+
+    // Transform cheques to include dealer info in the main object
+    const transformedCheques = cheques.map((cheque) => {
+      const chequeObj = cheque.toObject();
+      if (chequeObj.dealerId) {
+        chequeObj.dealerName = chequeObj.dealerId.name;
+        chequeObj.dealerCode = chequeObj.dealerId.code;
+        chequeObj.dealerPhone = chequeObj.dealerId.phone;
+        chequeObj.dealerAddress = chequeObj.dealerId.address;
+      }
+      return chequeObj;
+    });
+
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(total / limitNumber);
+    const hasNextPage = pageNumber < totalPages;
+    const hasPrevPage = pageNumber > 1;
+
+    res.json({
+      success: true,
+      cheques: transformedCheques,
+      pagination: {
+        currentPage: pageNumber,
+        totalPages,
+        totalItems: total,
+        itemsPerPage: limitNumber,
+        hasNextPage,
+        hasPrevPage,
+        nextPage: hasNextPage ? pageNumber + 1 : null,
+        prevPage: hasPrevPage ? pageNumber - 1 : null,
+      },
+    });
+  } catch (error) {
+    console.error("Get cheques error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Get single cheque
+export const getCheque = async (req, res) => {
+  try {
+    const { Cheque } = getModels(req.dbConnection);
+    const { id } = req.params;
+
+    const cheque = await Cheque.findOne({ _id: id, isDeleted: false })
+      .populate("dealerId", "name code phone address email")
+      .populate("createdBy", "name email")
+      .populate("updatedBy", "name email")
+      .select("-__v");
+
+    if (!cheque) {
+      return res.status(404).json({
+        success: false,
+        message: "Cheque not found",
+      });
+    }
+
+    // Transform cheque to include dealer info
+    const chequeObj = cheque.toObject();
+    if (chequeObj.dealerId) {
+      chequeObj.dealerName = chequeObj.dealerId.name;
+      chequeObj.dealerCode = chequeObj.dealerId.code;
+      chequeObj.dealerPhone = chequeObj.dealerId.phone;
+      chequeObj.dealerAddress = chequeObj.dealerId.address;
+      chequeObj.dealerEmail = chequeObj.dealerId.email;
+    }
+
+    res.json({
+      success: true,
+      cheque: chequeObj,
+    });
+  } catch (error) {
+    console.error("Get cheque error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Create new cheque
+export const createCheque = async (req, res) => {
+  try {
+    const { Cheque } = getModels(req.dbConnection);
+    const {
+      chequeNo,
+      amount,
+      date,
+      bankName,
+      bankBranch,
+      bankAccountNo,
+      dealerId,
+      remarks,
+    } = req.body;
+    if (!chequeNo || !amount || !date || !bankName || !dealerId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: chequeNo, amount, date, bankName, dealerId",
+      });
+    }
+    if (req.body.status && req.body.status !== 'Not Deposited') {
+      return res.status(400).json({
+        success: false,
+        message: 'New cheques must start as Not Deposited and follow the deposit/clearance workflow',
+      });
+    }
+
+    const result = await postDealerReceipt({
+      dbConnection: req.dbConnection,
+      dealerId,
+      receiptDate: date,
+      sourceType: 'ChequeRegistry',
+      sourceId: String(chequeNo).trim().toUpperCase(),
+      tenders: [{
+        mode: 'Cheque',
+        amount,
+        date,
+        cheque: {
+          chequeNo,
+          chequeDate: date,
+          bankName,
+          bankBranch,
+          bankAccountNo,
+        },
+      }],
+      actorId: req.user._id,
+      narration: remarks || `Cheque ${String(chequeNo).trim().toUpperCase()} received`,
+    });
+
+    const cheque = await Cheque.findById(result.cheques[0]._id)
+      .populate("dealerId", "name code phone address");
+    const chequeObj = cheque.toObject();
+    if (chequeObj.dealerId) {
+      chequeObj.dealerName = chequeObj.dealerId.name;
+      chequeObj.dealerCode = chequeObj.dealerId.code;
+      chequeObj.dealerPhone = chequeObj.dealerId.phone;
+      chequeObj.dealerAddress = chequeObj.dealerId.address;
+    }
+    return res.status(result.replayed ? 200 : 201).json({
+      success: true,
+      replayed: result.replayed,
+      message: result.replayed ? "Cheque was already recorded" : "Cheque received and posted successfully",
+      cheque: chequeObj,
+    });
+  } catch (error) {
+    if (handlePeriodLockError(error, res)) return;
+    console.error("Create cheque error:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.statusCode ? error.message : "Failed to receive cheque",
+      error: error.message,
+    });
+  }
+};
+
+// Update cheque
+export const updateCheque = async (req, res) => {
+  try {
+    const { Cheque, Dealer } = getModels(req.dbConnection);
+    const { id } = req.params;
+    const updateData = req.body;
+
+    // Find cheque
+    const cheque = await Cheque.findOne({ _id: id, isDeleted: false });
+    if (!cheque) {
+      return res.status(404).json({
+        success: false,
+        message: "Cheque not found",
+      });
+    }
+
+    if (cheque.receiptVoucher) {
+      const allowedFields = new Set(['remarks']);
+      const disallowed = Object.keys(updateData).filter((key) => !allowedFields.has(key));
+      if (disallowed.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: 'Posted cheque financial fields cannot be edited. Use deposit, clear, or bounce actions.',
+        });
+      }
+    }
+
+    // Check if dealer exists (if dealerId is being updated)
+    if (updateData.dealerId) {
+      const dealer = await Dealer.findById(updateData.dealerId);
+      if (!dealer) {
+        return res.status(404).json({
+          success: false,
+          message: "Dealer not found",
+        });
+      }
+    }
+
+    // Check if cheque number already exists (if chequeNo is being updated)
+    if (updateData.chequeNo && updateData.chequeNo !== cheque.chequeNo) {
+      const existingCheque = await Cheque.findOne({
+        chequeNo: updateData.chequeNo,
+        isDeleted: false,
+        _id: { $ne: id },
+      });
+      if (existingCheque) {
+        return res.status(400).json({
+          success: false,
+          message: "Cheque number already exists",
+        });
+      }
+    }
+
+    // Update cheque
+    Object.assign(cheque, updateData);
+    cheque.updatedBy = req.user._id;
+
+    // Convert date string to Date object if provided
+    if (updateData.date) {
+      cheque.date = new Date(updateData.date);
+    }
+
+    // Convert amount to number if provided
+    if (updateData.amount) {
+      cheque.amount = parseFloat(updateData.amount);
+    }
+
+    // Convert chequeNo to uppercase if provided
+    if (updateData.chequeNo) {
+      cheque.chequeNo = updateData.chequeNo.toUpperCase();
+    }
+
+    await cheque.save();
+
+    // Populate dealer info for response
+    await cheque.populate("dealerId", "name code phone address");
+
+    const chequeObj = cheque.toObject();
+    if (chequeObj.dealerId) {
+      chequeObj.dealerName = chequeObj.dealerId.name;
+      chequeObj.dealerCode = chequeObj.dealerId.code;
+      chequeObj.dealerPhone = chequeObj.dealerId.phone;
+      chequeObj.dealerAddress = chequeObj.dealerId.address;
+    }
+
+    res.json({
+      success: true,
+      message: "Cheque updated successfully",
+      cheque: chequeObj,
+    });
+  } catch (error) {
+    console.error("Update cheque error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Delete cheque (soft delete)
+export const deleteCheque = async (req, res) => {
+  try {
+    const { Cheque } = getModels(req.dbConnection);
+    const { id } = req.params;
+
+    const cheque = await Cheque.findOne({ _id: id, isDeleted: false });
+    if (!cheque) {
+      return res.status(404).json({
+        success: false,
+        message: "Cheque not found",
+      });
+    }
+
+    if (cheque.receiptVoucher) {
+      return res.status(409).json({
+        success: false,
+        message: 'Posted cheques cannot be deleted. Bounce or reverse the receipt instead.',
+      });
+    }
+
+    // Soft delete
+    cheque.isDeleted = true;
+    cheque.updatedBy = req.user._id;
+    await cheque.save();
+
+    res.json({
+      success: true,
+      message: "Cheque deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete cheque error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Update cheque status
+export const updateChequeStatus = async (req, res) => {
+  try {
+    const models = getModels(req.dbConnection);
+    const { id } = req.params;
+    const { status, remarks, bounceReason, bankAccount, statusDate } = req.body;
+    if (!['Deposited', 'Cleared', 'Bounced'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Status must be Deposited, Cleared, or Bounced',
+      });
+    }
+    if (status === 'Bounced' && !String(bounceReason || '').trim()) {
+      return res.status(400).json({ success: false, message: 'Bounce reason is required' });
+    }
+    const eventDate = new Date(statusDate || Date.now());
+    if (Number.isNaN(eventDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Status date is invalid' });
+    }
+    await assertPeriodOpen(req.dbConnection, eventDate, `cheque ${status.toLowerCase()}`);
+
+    const session = await req.dbConnection.startSession();
+    let chequeId;
+    let replayed = false;
+    try {
+      await session.withTransaction(async () => {
+        const cheque = await models.Cheque.findOne({ _id: id, isDeleted: false }).session(session);
+        if (!cheque) throw createReceiptError(404, 'Cheque not found');
+        chequeId = cheque._id;
+        if (cheque.status === status) {
+          replayed = true;
+          return;
+        }
+        if (!cheque.receiptVoucher) {
+          throw createReceiptError(409, 'Legacy cheque has no posted receipt and must be migrated before status changes');
+        }
+
+        const allowed = {
+          'Not Deposited': ['Deposited', 'Bounced'],
+          Deposited: ['Cleared', 'Bounced'],
+          Cleared: ['Bounced'],
+          Bounced: [],
+        };
+        if (!allowed[cheque.status]?.includes(status)) {
+          throw createReceiptError(409, `Cheque cannot move from ${cheque.status} to ${status}`);
+        }
+
+        if (status === 'Deposited') {
+          const targetBankId = bankAccount || cheque.depositBankAccount;
+          if (!targetBankId) throw createReceiptError(400, 'Select the bank account where the cheque was deposited');
+          const bank = await models.BankAccount.findOne({ _id: targetBankId, isActive: { $ne: false } }).session(session);
+          if (!bank) throw createReceiptError(400, 'Selected bank account was not found or is inactive');
+          cheque.status = 'Deposited';
+          cheque.depositDate = eventDate;
+          cheque.depositBankAccount = bank._id;
+        } else if (status === 'Cleared') {
+          const targetBankId = bankAccount || cheque.depositBankAccount;
+          if (!targetBankId) throw createReceiptError(400, 'Select the bank account that cleared the cheque');
+          const bank = await models.BankAccount.findOne({ _id: targetBankId, isActive: { $ne: false } }).session(session);
+          if (!bank) throw createReceiptError(400, 'Selected bank account was not found or is inactive');
+          const bankResult = await models.BankAccount.updateOne(
+            { _id: bank._id, currentBalance: bank.currentBalance },
+            { $inc: { currentBalance: cheque.amount }, $set: { updatedAt: new Date() } },
+            { session }
+          );
+          if (bankResult.matchedCount !== 1) throw createReceiptError(409, 'Bank balance changed while clearing; please retry');
+
+          const [bankControl, chequesInHand] = await Promise.all([
+            models.AccountMaster.findOne({ accountName: 'Bank Account' }).session(session),
+            models.AccountMaster.findOne({ accountName: 'Cheques in Hand' }).session(session),
+          ]);
+          if (!bankControl || !chequesInHand) {
+            throw createReceiptError(409, 'Bank Account or Cheques in Hand system account is not configured');
+          }
+          const clearanceJournal = new models.JournalVoucher({
+            voucherNumber: `JV-CHQ-${String(cheque._id).slice(-12).toUpperCase()}-CLR`,
+            voucherDate: eventDate,
+            financialYear: getFinancialYear(eventDate),
+            voucherType: 'Receipt',
+            referenceType: 'Manual',
+            referenceId: cheque._id,
+            referenceNumber: cheque.chequeNo,
+            postingKey: `${cheque.postingKey}:clearance`,
+            entries: [
+              { accountId: bankControl._id, accountName: bankControl.accountName, accountGroup: bankControl.accountGroup, debit: cheque.amount, credit: 0, narration: `Cheque ${cheque.chequeNo} cleared` },
+              { accountId: chequesInHand._id, accountName: chequesInHand.accountName, accountGroup: chequesInHand.accountGroup, debit: 0, credit: cheque.amount, narration: `Cheque ${cheque.chequeNo} moved to bank` },
+            ],
+            totalDebit: cheque.amount,
+            totalCredit: cheque.amount,
+            totalAmount: cheque.amount,
+            narration: `Clearance of cheque ${cheque.chequeNo}`,
+            isAutoGenerated: true,
+            createdBy: req.user._id,
+          });
+          await clearanceJournal.save({ session });
+          cheque.status = 'Cleared';
+          cheque.clearingDate = eventDate;
+          cheque.depositBankAccount = bank._id;
+          cheque.clearanceJournal = clearanceJournal._id;
+        } else {
+          const activeAllocations = await models.PaymentAllocation.find({
+            voucherId: cheque.receiptVoucher,
+            $or: [{ status: 'Active' }, { status: null }, { status: { $exists: false } }],
+          }).session(session);
+          for (const allocation of activeAllocations) {
+            await reversePaymentAllocationById({
+              dbConnection: req.dbConnection,
+              allocationId: allocation._id,
+              userId: req.user._id,
+              reason: `Cheque ${cheque.chequeNo} bounced: ${String(bounceReason).trim()}`,
+            }, { session });
+          }
+
+          const receiptReversal = await reverseDealerReceipt({
+            dbConnection: req.dbConnection,
+            voucherIds: [cheque.receiptVoucher],
+            actorId: req.user._id,
+            reason: `Cheque ${cheque.chequeNo} bounced: ${String(bounceReason).trim()}`,
+            reversalDate: eventDate,
+          }, { session });
+          const receiptReversalJournal = await models.JournalVoucher.findOne({
+            referenceId: cheque.receiptVoucher,
+            postingKey: { $regex: /:reversal-journal$/ },
+          }).session(session);
+          cheque.status = 'Bounced';
+          cheque.bounceDate = eventDate;
+          cheque.bounceReason = String(bounceReason).trim();
+          cheque.bounceJournal = receiptReversalJournal?._id;
+          if (receiptReversal.replayed) replayed = true;
+        }
+
+        if (remarks) cheque.remarks = remarks;
+        cheque.updatedBy = req.user._id;
+        await cheque.save({ session });
+        await models.Voucher.updateOne(
+          { _id: cheque.receiptVoucher },
+          { $set: { chequeStatus: status === 'Deposited' ? 'Pending' : status } },
+          { session }
+        );
+        await models.DealerLedger.updateMany(
+          { referenceId: cheque.receiptVoucher, 'chequeDetails.chequeNo': cheque.chequeNo },
+          { $set: { 'chequeDetails.status': status === 'Deposited' ? 'Pending' : status } },
+          { session }
+        );
+      }, {
+        readConcern: { level: 'snapshot' },
+        writeConcern: { w: 'majority' },
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    const cheque = await models.Cheque.findById(chequeId).populate('dealerId', 'name code');
+    return res.json({
+      success: true,
+      replayed,
+      message: replayed ? `Cheque was already ${status.toLowerCase()}` : `Cheque ${status.toLowerCase()} successfully`,
+      cheque,
+    });
+  } catch (error) {
+    if (handlePeriodLockError(error, res)) return;
+    console.error('Update cheque status error:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.statusCode ? error.message : 'Failed to update cheque status',
+      error: error.message,
+    });
+  }
+};
+
+// Get cheques by dealer
+export const getChequesByDealer = async (req, res) => {
+  try {
+    const { Cheque } = getModels(req.dbConnection);
+    const { dealerId } = req.params;
+    const { page = 1, limit = 10, status, sortBy = "date", sortOrder = "desc" } = req.query;
+
+    const pageNumber = safeParseInt(page, 1);
+    const limitNumber = safeParseInt(limit, 10);
+    const skip = (pageNumber - 1) * limitNumber;
+
+    const filter = { dealerId, isDeleted: false };
+
+    if (status && status !== "All") {
+      filter.status = status;
+    }
+
+    const sort = {};
+    sort[sortBy] = sortOrder === "desc" ? -1 : 1;
+
+    const total = await Cheque.countDocuments(filter);
+    const cheques = await Cheque.find(filter)
+      .populate("dealerId", "name code phone address")
+      .sort(sort)
+      .limit(limitNumber)
+      .skip(skip)
+      .select("-__v");
+
+    const totalPages = Math.ceil(total / limitNumber);
+
+    res.json({
+      success: true,
+      cheques,
+      pagination: {
+        currentPage: pageNumber,
+        totalPages,
+        totalItems: total,
+        itemsPerPage: limitNumber,
+      },
+    });
+  } catch (error) {
+    console.error("Get cheques by dealer error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Get cheques by status
+export const getChequesByStatus = async (req, res) => {
+  try {
+    const { Cheque, Dealer } = getModels(req.dbConnection);
+    const { status } = req.params;
+    const { page = 1, limit = 10, dealer, sortBy = "date", sortOrder = "desc" } = req.query;
+
+    const pageNumber = safeParseInt(page, 1);
+    const limitNumber = safeParseInt(limit, 10);
+    const skip = (pageNumber - 1) * limitNumber;
+
+    const filter = { status, isDeleted: false };
+
+    if (dealer && dealer !== "All") {
+      const dealerDoc = await Dealer.findOne({ code: dealer });
+      if (dealerDoc) {
+        filter.dealerId = dealerDoc._id;
+      }
+    }
+
+    const sort = {};
+    sort[sortBy] = sortOrder === "desc" ? -1 : 1;
+
+    const total = await Cheque.countDocuments(filter);
+    const cheques = await Cheque.find(filter)
+      .populate("dealerId", "name code phone address")
+      .sort(sort)
+      .limit(limitNumber)
+      .skip(skip)
+      .select("-__v");
+
+    const totalPages = Math.ceil(total / limitNumber);
+
+    res.json({
+      success: true,
+      cheques,
+      pagination: {
+        currentPage: pageNumber,
+        totalPages,
+        totalItems: total,
+        itemsPerPage: limitNumber,
+      },
+    });
+  } catch (error) {
+    console.error("Get cheques by status error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Get cheque statistics
+export const getChequeStats = async (req, res) => {
+  try {
+    const { Cheque } = getModels(req.dbConnection);
+    const { dealerId, status, startDate, endDate } = req.query;
+
+    const filters = {};
+    if (dealerId) filters.dealerId = dealerId;
+    if (status) filters.status = status;
+    if (startDate && endDate) {
+      filters.startDate = startDate;
+      filters.endDate = endDate;
+    }
+
+    // Get stats using model static method if available, otherwise calculate manually
+    let stats;
+    if (typeof Cheque.getStats === 'function') {
+      stats = await Cheque.getStats(filters);
+    } else {
+      // Manual calculation
+      const matchFilter = { isDeleted: false };
+      if (dealerId) matchFilter.dealerId = dealerId;
+      if (status) matchFilter.status = status;
+      if (startDate && endDate) {
+        matchFilter.date = { $gte: new Date(startDate), $lte: new Date(endDate) };
+      }
+      
+      const result = await Cheque.aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: null,
+            totalCheques: { $sum: 1 },
+            totalAmount: { $sum: "$amount" }
+          }
+        }
+      ]);
+      stats = result[0] || { totalCheques: 0, totalAmount: 0 };
+    }
+
+    // Get status counts
+    const statusCounts = await Cheque.aggregate([
+      { $match: { isDeleted: false, ...filters } },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    const statusBreakdown = {};
+    statusCounts.forEach((item) => {
+      statusBreakdown[item._id] = {
+        count: item.count,
+        totalAmount: item.totalAmount,
+      };
+    });
+
+    res.json({
+      success: true,
+      stats: {
+        ...stats,
+        statusBreakdown,
+      },
+    });
+  } catch (error) {
+    console.error("Get cheque stats error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// Generate cheque report
+export const getChequeReport = async (req, res) => {
+  try {
+    const { Cheque } = getModels(req.dbConnection);
+    const {
+      startDate,
+      endDate,
+      status,
+      dealerId,
+      format = "json",
+    } = req.query;
+
+    const filter = { isDeleted: false };
+
+    if (startDate && endDate) {
+      filter.date = {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate),
+      };
+    }
+
+    if (status && status !== "All") {
+      filter.status = status;
+    }
+
+    if (dealerId) {
+      filter.dealerId = dealerId;
+    }
+
+    const cheques = await Cheque.find(filter)
+      .populate("dealerId", "name code phone address")
+      .populate("createdBy", "name email")
+      .sort({ date: -1 })
+      .select("-__v");
+
+    // Get stats using model static method if available
+    let stats;
+    if (typeof Cheque.getStats === 'function') {
+      stats = await Cheque.getStats({
+        startDate,
+        endDate,
+        status,
+        dealerId,
+      });
+    } else {
+      const result = await Cheque.aggregate([
+        { $match: filter },
+        {
+          $group: {
+            _id: null,
+            totalCheques: { $sum: 1 },
+            totalAmount: { $sum: "$amount" }
+          }
+        }
+      ]);
+      stats = result[0] || { totalCheques: 0, totalAmount: 0 };
+    }
+
+    if (format === "csv") {
+      // Generate CSV report
+      const csvData = cheques.map((cheque) => {
+        const dealer = cheque.dealerId;
+        return {
+          "Cheque No": cheque.chequeNo,
+          "Amount": cheque.amount,
+          "Date": cheque.date.toISOString().split("T")[0],
+          "Status": cheque.status,
+          "Bank Name": cheque.bankName,
+          "Dealer Name": dealer?.name || "N/A",
+          "Dealer Code": dealer?.code || "N/A",
+          "Dealer Phone": dealer?.phone || "N/A",
+          "Remarks": cheque.remarks || "",
+        };
+      });
+
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", "attachment; filename=cheque-report.csv");
+      
+      // Convert to CSV string
+      const csvString = [
+        Object.keys(csvData[0] || {}).join(","),
+        ...csvData.map((row) => Object.values(row).join(",")),
+      ].join("\n");
+
+      return res.send(csvString);
+    }
+
+    res.json({
+      success: true,
+      report: {
+        cheques,
+        stats,
+        generatedAt: new Date(),
+        filters: {
+          startDate,
+          endDate,
+          status,
+          dealerId,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Get cheque report error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+
+
+
+
+
+
+
